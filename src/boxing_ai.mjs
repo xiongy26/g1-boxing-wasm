@@ -324,8 +324,11 @@ export class BoxingController {
     if (f.traj) f.traj.push({ t: this.time, obs: Array.from(obs), action });
     const name = TACTIC_ACTIONS[action];
     // tracking mode: the decision only queues the next clip — the motion layer
-    // executes it at the current clip's guard boundary
+    // executes it at the current clip's guard boundary. A queued/playing punch
+    // is never overwritten by later footwork decisions (queue lock), otherwise
+    // the rapid non-attack decisions starve punches out before the boundary.
     if (f.tracking) {
+      if (f.clip !== 'guard' || (f.desiredClip && f.desiredClip !== 'guard')) return true;
       f.desiredClip = TACTIC_CLIP[name] ?? 'guard';
       return true;
     }
