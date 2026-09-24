@@ -1,0 +1,18 @@
+node_modules/
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+
+# 工作目录临时文件（参考仓库克隆、E2E 临时脚本等），不进版本库
+.workbuddy/tmp/
+
+# 本地记忆/日志不进公开仓库（如需保留可删除此行）
+.workbuddy/memory/
+
+# 整个 .workbuddy 是实验/训练工作区（GPU 环境、克隆的参考仓库、checkpoint，
+# 共 ~9GB）：阶段4 可复现产物已全部落在项目目录内
+# （tools/*.py、src/tracking_policy.mjs、vendor/policy/boxing_*、docs/stage4-tracking-notes.md）
+.workbuddy/
+.venv/
+*.log

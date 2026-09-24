@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>G1 机器人拳击 · MuJoCo WASM</title>
+<style>
+  :root {
+    --red: #ff4d4d;
+    --blue: #4d7dff;
+    --bg: #0b0e14;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: var(--bg); }
+  body { font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; color: #e8eaf0; }
+  canvas { display: block; }
+
+  #loading {
+    position: fixed; inset: 0; display: flex; flex-direction: column; gap: 18px;
+    align-items: center; justify-content: center; background: var(--bg); z-index: 100;
+    transition: opacity .5s;
+  }
+  #loading h1 { font-size: 26px; letter-spacing: 2px; }
+  #loading .bar { width: 320px; height: 6px; background: #1d2333; border-radius: 3px; overflow: hidden; }
+  #loading .bar > div { height: 100%; width: 0%; background: linear-gradient(90deg, var(--red), var(--blue)); transition: width .2s; }
+  #loading .sub { color: #8a93a8; font-size: 13px; }
+
+  #hud { position: fixed; inset: 0; pointer-events: none; z-index: 10; }
+  #hud .clickable { pointer-events: auto; }
+
+  /* scoreboard */
+  #scoreboard {
+    position: absolute; top: 14px; left: 50%; transform: translateX(-50%);
+    display: flex; align-items: stretch; gap: 2px; user-select: none;
+  }
+  .corner {
+    min-width: 170px; padding: 10px 18px; background: rgba(13,17,27,.82);
+    border-top: 3px solid var(--red); border-radius: 10px 10px 0 0;
+    backdrop-filter: blur(6px);
+  }
+  .corner.blue { border-top-color: var(--blue); }
+  .corner .name { font-size: 14px; font-weight: 600; letter-spacing: 1px; }
+  .corner .pts { font-size: 30px; font-weight: 700; line-height: 1.1; }
+  .corner.red .name, .corner.red .pts { color: var(--red); }
+  .corner.blue .name, .corner.blue .pts { color: var(--blue); }
+  .corner .sub { font-size: 11px; color: #8a93a8; }
+  .corner .hp { height: 5px; margin-top: 6px; background: #1d2333; border-radius: 3px; overflow: hidden; }
+  .corner .hp > div { height: 100%; width: 100%; background: var(--red); transition: width .25s; }
+  .corner.blue .hp > div { background: var(--blue); }
+  #clock {
+    padding: 10px 16px; background: rgba(13,17,27,.82); border-radius: 10px;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    backdrop-filter: blur(6px);
+  }
+  #clock .t { font-size: 24px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  #clock .r { font-size: 11px; color: #8a93a8; letter-spacing: 1px; }
+
+  /* banner */
+  #banner {
+    position: absolute; top: 34%; left: 50%; transform: translate(-50%,-50%) scale(.9);
+    font-size: 54px; font-weight: 800; letter-spacing: 6px; opacity: 0;
+    text-shadow: 0 0 30px rgba(0,0,0,.7); transition: all .18s; text-align: center;
+    white-space: nowrap;
+  }
+  #banner.show { opacity: 1; transform: translate(-50%,-50%) scale(1); }
+  #banner .small { display: block; font-size: 20px; letter-spacing: 3px; color: #cfd6e4; margin-top: 8px; font-weight: 500; }
+
+  /* floating combat text */
+  .float {
+    position: absolute; font-weight: 800; font-size: 22px; pointer-events: none;
+    text-shadow: 0 2px 8px rgba(0,0,0,.8); animation: floatUp 1s forwards; white-space: nowrap;
+  }
+  @keyframes floatUp {
+    0% { opacity: 0; transform: translateY(6px) scale(.8); }
+    15% { opacity: 1; transform: translateY(0) scale(1.1); }
+    100% { opacity: 0; transform: translateY(-46px) scale(1); }
+  }
+
+  /* hit flash */
+  #flash { position: absolute; inset: 0; opacity: 0; }
+  #flash.left { box-shadow: inset 90px 0 120px -60px rgba(255,77,77,.75); }
+  #flash.right { box-shadow: inset -90px 0 120px -60px rgba(77,125,255,.75); }
+  #flash.pop { animation: flashPop .4s; }
+  @keyframes flashPop { 0% { opacity: 1; } 100% { opacity: 0; } }
+
+  /* controls */
+  #panel {
+    position: absolute; left: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px;
+    background: rgba(13,17,27,.82); padding: 12px 14px; border-radius: 12px;
+    backdrop-filter: blur(6px); font-size: 13px; min-width: 210px;
+  }
+  #panel .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  #panel label { color: #aab3c5; }
+  button {
+    background: #1d2333; color: #e8eaf0; border: 1px solid #2a3348; border-radius: 7px;
+    padding: 5px 12px; cursor: pointer; font-size: 12.5px; font-family: inherit;
+  }
+  button:hover { background: #27304a; }
+  button.on { background: #2b4a8f; border-color: #3d63b8; }
+  input[type=range] { width: 110px; accent-color: #4d7dff; }
+  #legend {
+    position: absolute; right: 16px; bottom: 16px; text-align: right;
+    color: #6f7890; font-size: 11.5px; line-height: 1.7; user-select: none;
+  }
+  #stats { position: absolute; left: 16px; top: 14px; font-size: 11px; color: #6f7890; line-height: 1.6; user-select: none; }
+</style>
+</head>
+<body>
+<div id="loading">
+  <h1>G1 机器人拳击 · MuJoCo WASM</h1>
+  <div class="bar"><div id="loadbar"></div></div>
+  <div class="sub" id="loadmsg">正在加载 MuJoCo WebAssembly 引擎…</div>
+</div>
+
+<div id="hud">
+  <div id="scoreboard">
+    <div class="corner red">
+      <div class="name">红方 · G1-A</div>
+      <div class="pts" id="ptsA">0</div>
+      <div class="sub">命中 <span id="hitsA">0</span></div>
+      <div class="hp"><div id="hpA"></div></div>
+    </div>
+    <div id="clock"><div class="t" id="time">0:00</div><div class="r">回合 <span id="round">1</span></div></div>
+    <div class="corner blue">
+      <div class="name">G1-B · 蓝方</div>
+      <div class="pts" id="ptsB">0</div>
+      <div class="sub">命中 <span id="hitsB">0</span></div>
+      <div class="hp"><div id="hpB"></div></div>
+    </div>
+  </div>
+
+  <div id="banner"></div>
+  <div id="flash"></div>
+
+  <div id="panel" class="clickable">
+    <div class="row"><label>仿真速度</label>
+      <span><button data-speed="0.5">0.5×</button><button data-speed="1" class="on">1×</button><button data-speed="2">2×</button></span>
+    </div>
+    <div class="row"><label>攻击性</label><input type="range" id="aggr" min="0.5" max="2" step="0.1" value="1"></div>
+    <div class="row"><label>RL 策略</label>
+      <span><button id="rlABtn" class="on">A: AMO 策略</button><button id="rlBBtn" class="on">B: AMO 策略</button></span>
+    </div>
+    <div class="row">
+      <button id="pauseBtn">暂停</button>
+      <button id="resetBtn">重置比赛</button>
+    </div>
+    <div class="row">
+      <button id="assistBtn" class="on">平衡辅助 开</button>
+      <button id="contactBtn">接触点 关</button>
+    </div>
+    <div class="row">
+      <button id="orbitBtn" class="on">镜头环绕 开</button>
+      <button id="tacticsBtn" disabled title="自博弈训练的战术策略（vendor/tactics/tactics.json）">战术 AI 关</button>
+    </div>
+    <div class="row">
+      <button id="sceneBtn" title="阶段4：29自由度追踪机器人 + 拳击片段策略（需 vendor/policy/boxing_*.bin）">追踪模式 关</button>
+    </div>
+  </div>
+  <div id="stats"></div>
+  <div id="legend">
+    红方 G1-A vs 蓝方 G1-B · Unitree G1<br>
+    MuJoCo 3.13 WebAssembly + Three.js · 拳套/头部/躯干为碰撞体<br>
+    AMO 模式：RSS 2025 全身 RL 策略自主平衡行走，无吊架 · 击中头部 +2 / 躯干 +1
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three/three.module.js",
+    "three/addons/": "./vendor/three/examples/jsm/"
+  }
+}
+</script>
+<script type="module" src="./src/main.js"></script>
+</body>
+</html>
