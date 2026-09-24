@@ -20,7 +20,14 @@ QUEUE=("cross:4096" "hook:4096")
 
 log() { echo "[$(date '+%m-%d %H:%M')] $*" >> "$WATCH_LOG"; }
 alive() { kill -0 "$1" 2>/dev/null; }
-find_rundir() { ls -td "$TRAIN_DIR"/logs/rsl_rl/g1_boxing/*/ 2>/dev/null | head -1; }
+# newest run dir whose dumped env config references this clip's motion npz
+# (survives restarts/resumes: each run creates a fresh timestamped dir)
+find_rundir() { # clip-motion-name (e.g. boxing_jab)
+  for d in $(ls -td "$TRAIN_DIR"/logs/rsl_rl/g1_boxing/*/ 2>/dev/null); do
+    if grep -aq "$1.npz" "$d/params/env.yaml" 2>/dev/null; then echo "$d"; return 0; fi
+  done
+  return 1
+}
 backup() { mkdir -p "/tmp/policy_bak_boxing_$1"; cp "$ROOT"/vendor/policy/boxing_"$1".* "/tmp/policy_bak_boxing_$1/" 2>/dev/null || true; }
 restore() { cp "/tmp/policy_bak_boxing_$1"/boxing_"$1".* "$ROOT/vendor/policy/" 2>/dev/null || true; }
 
@@ -49,16 +56,16 @@ start_training() { # clip envs
       --env.commands.motion.motion-file "$NPZ/boxing_$clip.npz" \
       --env.scene.num-envs "$envs" --agent.max-iterations 20000 \
       > "/tmp/train_$clip.log" 2>&1 & echo $! > "/tmp/train_$clip.pid" )
-  sleep 150                       # 等.mjlab 初始化并创建 run 目录
+  sleep 150                       # 等 mjlab 初始化并创建 run 目录
   pid=$(cat "/tmp/train_$clip.pid" 2>/dev/null || echo 0)
-  rundir=$(find_rundir)
+  rundir=$(find_rundir "boxing_$clip")
   RUNS[$clip]="$pid|$rundir|/tmp/train_$clip.log"
   log "started $clip pid=$pid rundir=$rundir"
 }
 
-# --- 接管当前已在跑的两个训练（run 目录已确认过：jab=00-34-05, guard=00-35-17）
-RUNS[jab]="$(pgrep -f 'motion-file.*boxing_jab.npz' | head -1)|$TRAIN_DIR/logs/rsl_rl/g1_boxing/2026-09-24_00-34-05|/tmp/train_jab.log"
-RUNS[guard]="$(pgrep -f 'motion-file.*boxing_guard_idle.npz' | head -1)|$TRAIN_DIR/logs/rsl_rl/g1_boxing/2026-09-24_00-35-17|/tmp/train_guard.log"
+# --- 接管当前在跑的两个训练（pid 按 motion 名匹配，run 目录按 env.yaml 发现）
+RUNS[jab]="$(pgrep -f 'motion-file.*boxing_jab.npz' | head -1)|$(find_rundir boxing_jab)|/tmp/train_jab.log"
+RUNS[guard]="$(pgrep -f 'motion-file.*boxing_guard_idle.npz' | head -1)|$(find_rundir boxing_guard_idle)|/tmp/train_guard.log"
 
 log "=== watchdog start: 监控 ${!RUNS[@]}，队列 ${QUEUE[*]} ==="
 while :; do
