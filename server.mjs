@@ -27,7 +27,8 @@ http.createServer((req, res) => {
   // 老页面的 index.html 可能被浏览器长期缓存（历史响应没带禁缓存头）——
   // 把 "/" 302 到带版本号的地址，强制一次缓存未命中，此后 no-cache 接管
   if (urlPath === '/') {
-    res.writeHead(302, { Location: '/index.html?v=3', 'Cache-Control': 'no-store' });
+    const search = new URL(req.url, 'http://x').search || '';
+    res.writeHead(302, { Location: '/index.html?v=3' + (search ? '&' + search.slice(1) : ''), 'Cache-Control': 'no-store' });
     res.end();
     return;
   }
