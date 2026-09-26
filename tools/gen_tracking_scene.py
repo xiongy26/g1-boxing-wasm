@@ -148,8 +148,8 @@ ET.SubElement(world, "geom", {"name": "floor", "type": "plane", "size": "6 6 0.1
                               "material": "floor_mat", "condim": "3",
                               "friction": "1 0.005 0.0001"})
 
-robots = [make_robot("A_", "-0.42 0 0.761", None),
-          make_robot("B_", "0.42 0 0.761", "0 0 0 1")]
+robots = [make_robot("A_", "-0.50 0 0.761", None),
+          make_robot("B_", "0.50 0 0.761", "0 0 0 1")]
 
 # collect mesh assets + robot materials (dedupe by prefixed name)
 seen = set()
@@ -181,8 +181,8 @@ for p in ("A_", "B_"):
         ET.SubElement(act_all, "motor", {"name": f"{p}{j}", "joint": f"{p}{j}"})
 
 key = ET.SubElement(ET.SubElement(mujoco, "keyframe"), "key", {"name": "ready"})
-qa = ["-0.42", "0", "0.761", "1", "0", "0", "0"] + [f"{v}" for v in GUARD]
-qb = ["0.42", "0", "0.761", "0", "0", "0", "1"] + [f"{v}" for v in GUARD]
+qa = ["-0.50", "0", "0.761", "1", "0", "0", "0"] + [f"{v}" for v in GUARD]
+qb = ["0.50", "0", "0.761", "0", "0", "0", "1"] + [f"{v}" for v in GUARD]
 key.set("qpos", " ".join(qa + qb))
 key.set("ctrl", " ".join(["0"] * 58))
 

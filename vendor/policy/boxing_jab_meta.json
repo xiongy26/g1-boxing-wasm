@@ -1,6 +1,6 @@
 {
  "format": "tracking_v1",
- "source": ".workbuddy/gpu/g1_boxing_task/logs/rsl_rl/g1_boxing/2026-09-24_00-35-17/2026-09-24_00-35-17.onnx",
+ "source": "/home/xy/zcode/g1-boxing-wasm/.workbuddy/gpu/g1_boxing_task/logs/rsl_rl/g1_boxing/2026-09-24_20-41-29//2026-09-24_20-41-29.onnx",
  "obs_dim": 154,
  "num_joints": 29,
  "num_bodies": 14,
@@ -212,8 +212,8 @@
  },
  "motion": {
   "fps": 50,
-  "length": 449,
-  "max_step": 448
+  "length": 239,
+  "max_step": 238
  },
  "offsets": {
   "mean": 0,
@@ -227,11 +227,11 @@
   "b:2": 989904,
   "b:3": 990416,
   "motion:joint_pos": 990532,
-  "motion:joint_vel": 1042616,
-  "motion:body_pos_w": 1094700,
-  "motion:body_quat_w": 1170132,
-  "motion:body_lin_vel_w": 1270708,
-  "motion:body_ang_vel_w": 1346140
+  "motion:joint_vel": 1018256,
+  "motion:body_pos_w": 1045980,
+  "motion:body_quat_w": 1086132,
+  "motion:body_lin_vel_w": 1139668,
+  "motion:body_ang_vel_w": 1179820
  },
  "shapes": {
   "mean": [
@@ -269,30 +269,30 @@
    29
   ],
   "motion:joint_pos": [
-   449,
+   239,
    29
   ],
   "motion:joint_vel": [
-   449,
+   239,
    29
   ],
   "motion:body_pos_w": [
-   449,
+   239,
    14,
    3
   ],
   "motion:body_quat_w": [
-   449,
+   239,
    14,
    4
   ],
   "motion:body_lin_vel_w": [
-   449,
+   239,
    14,
    3
   ],
   "motion:body_ang_vel_w": [
-   449,
+   239,
    14,
    3
   ]
