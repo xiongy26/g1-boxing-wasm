@@ -41,11 +41,14 @@ TRANSITION_DURATION = 0.5   # s, blend between guard and clip
 PAD_DURATION = 1.0          # s, hold guard before the blend
 
 # windows picked from the extension-event scan over g1_fight1_subject2
-# (name, source stem, t0, t1) — times in seconds into the source clip
+# (name, source stem, t0, t1) — times in seconds into the source clip.
+# v2 直立窗口（2026-09-26）：v1 的深蹲窗口（骨盆压到 0.487m）是 20k 策略的
+# 失稳源——双机对练里频繁在深蹲段自摔。v2 只选骨盆全程 >0.6m 的直立出拳
+# 窗口（见 docs/stage4-tracking-notes.md 待办）。
 WINDOWS = [
-    ("boxing_jab",   "g1_fight1_subject2", 24.60, 26.40),  # quick R straight, root ~static
-    ("boxing_cross", "g1_fight1_subject2", 38.90, 41.50),  # committed R straight
-    ("boxing_hook",  "g1_fight1_subject2", 218.70, 220.50),  # L swing, hook-like arc
+    ("boxing_jab",   "g1_fight1_subject2", 234.90, 235.90),  # L 直拳，几乎原地（0.19m），z≥0.72
+    ("boxing_cross", "g1_fight1_subject2", 21.75, 22.75),    # R 后手直拳，0.35m，z≥0.63
+    ("boxing_hook",  "g1_fight1_subject2", 219.50, 220.30),  # L 弧线拳，0.80m，z≥0.69
 ]
 
 

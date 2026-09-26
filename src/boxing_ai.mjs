@@ -30,6 +30,18 @@ const TACTIC_CLIP = {
   jab: 'jab', double: 'jab', cross: 'cross', hook: 'hook',
 };
 
+// pelvis-to-pelvis distance window at which a punch clip may START. The punch
+// motions carry forward drive (jab ~0.2m, cross/hook ~0.8-1.0m): firing them
+// point-blank turns the lunge into a body-check tangle, firing them too far
+// is a whiff-charge. Outside the window the scheduler plays guard instead.
+const PUNCH_RANGE = {
+  // 标定（拳-头最小距离 vs 起始间距）：单方面出拳够不着（0.49m@0.7m 间距），
+  // 命中发生在双方面互刺、各自前倾 0.2-0.4m 的交换里——窗口收窄到接触带
+  jab: [0.62, 1.05],
+  cross: [0.62, 1.05],
+  hook: [0.62, 1.05],
+};
+
 const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
 
 // AMO arm targets (8): [L_sp, L_sr, L_sy, L_elbow, R_sp, R_sr, R_sy, R_elbow].
@@ -214,6 +226,7 @@ export class BoxingController {
     this.time = 0;
     this._lastSimTime = -1;
     this._divergences = 0;
+    this._farT = 0;   // 追踪模式僵局计时：双机距离过远且无法拉近时重置回合
   }
 
   // ---- AMO mode ---------------------------------------------------------------
@@ -481,19 +494,34 @@ export class BoxingController {
 
       // ---- drive the robot ----
       if (f.tracking) {
-        // stage-4 motion layer: play the current clip; swap at its guard boundary
+        // stage-4 motion layer: play the current clip; swap at its guard boundary.
+        // All clips bookend with the SAME guard stance, so the swap hands the
+        // previous fighter's last action / PD target straight to the new one
+        // (cross-fade-lite): zeroing them instead would snap the pose for one
+        // tick right as the punch clips head into their marginal deep stance.
         if (f.tracking.clipDone) {
+          const prev = f.tracking;
           if (f.clip !== 'guard' && f.desiredClip === f.clip) f.desiredClip = 'guard';
-          const want = f.desiredClip && f.trackingClips[f.desiredClip] ? f.desiredClip : 'guard';
-          if (want !== f.clip) {
-            f.tracking = new TrackingFighter(this.mujoco, this.model, this.data, side,
+          let want = f.desiredClip && f.trackingClips[f.desiredClip] ? f.desiredClip : 'guard';
+          if (want !== 'guard') {
+            const r = PUNCH_RANGE[want];
+            if (!(dist >= r[0] && dist <= r[1])) want = 'guard';  // 距离不合适：本轮不出拳
+            // （允许同时出拳：互相前倾才够得着对方的头——见 PUNCH_RANGE 标定）
+          }
+          if (want !== f.clip || want !== 'guard') {
+            const nf = new TrackingFighter(this.mujoco, this.model, this.data, side,
               f.trackingClips[want], side === 'B' ? { yawOffset: Math.PI } : {});
-            f.tracking.reset(0);
+            nf.reset(0);
+            nf.lastAction.set(prev.lastAction);
+            nf.pdTarget.set(prev.pdTarget);
+            f.tracking = nf;
             f.clip = want;
             f.clipSwaps++;
-            if (want !== 'guard') f.desiredClip = 'guard'; // queue consumed
+            f.desiredClip = 'guard';  // 队列已消费（无论打没打）
           } else {
-            f.tracking.reset(0);   // loop the guard clip in place
+            f.tracking.reset(0);
+            f.tracking.lastAction.set(prev.lastAction);
+            f.tracking.pdTarget.set(prev.pdTarget);
           }
         }
         f.tracking.physicsStep(4);
@@ -538,10 +566,37 @@ export class BoxingController {
       const b = side === 'A' ? this.ids.pelvisA : this.ids.pelvisB;
       const px = d.xpos[3 * b], py = d.xpos[3 * b + 1], pz = d.xpos[3 * b + 2];
       let fx = 0, fy = 0, fz = 0, tx = 0, ty = 0, tz = 0;
-      if (this.assist && !f.amo && !f.tracking && !f.down) {
+      if (this.assist && !f.amo && !f.down) {
         if (!f._ppos) f._ppos = [px, py, pz];
         const vxx = (px - f._ppos[0]) / dt, vyy = (py - f._ppos[1]) / dt, vzz = (pz - f._ppos[2]) / dt;
         f._ppos = [px, py, pz];
+        if (f.tracking) {
+          // tracking mode: no XY anchor (the clip owns planar motion), only a
+          // soft vertical seat toward the reference pelvis height. The punch
+          // clips' deep stance (0.487m) is the policies' least stable window —
+          // this keeps a wobbling crouch from becoming a self-KO. ~30N typical,
+          // capped well below body weight: tracking dynamics stay dominant.
+          const refZ = f.tracking.net.refAt(f.tracking.timeStep).body_pos_w[2];
+          fz = clamp(120 * (refZ - pz) - 25 * vzz, 0, 110);
+          // 躯干扶正：深蹲段的侧向倾倒（垂直托力救不了）——小力矩扶正骨盆，
+          // 幅度远小于脚本模式的吊架
+          const R = d.xmat, o = 9 * b;
+          const w = this.freeDof[side] + 3;
+          const wx = d.qvel[w], wy = d.qvel[w + 1], wz = d.qvel[w + 2];
+          tx = clamp(100 * R[o + 5] - 8 * wx, -55, 55);
+          ty = clamp(-100 * R[o + 2] - 8 * wy, -55, 55);
+          tz = clamp(-8 * wz, -15, 15);
+          // 缠斗分离：punch 片段只拉近距离（cross 前冲 0.8m），守卫片段原地——
+          // 没有东西能拉开距离，贴身后必然缠倒。距离 <0.55m 时给双方一个
+          // 温和的分离力，等效裁判分开缠斗，让下一轮出拳在有效距离发起。
+          const op = this.pelvisPos(f.opponent.side);
+          const dx = px - op[0], dy = py - op[1];
+          const dd = Math.hypot(dx, dy) || 1e-6;
+          if (dd < 0.55 && !f.opponent.down) {
+            const s = clamp(90 * (0.55 - dd), 0, 80);
+            fx += s * dx / dd; fy += s * dy / dd;
+          }
+        } else {
         const hurt = f.staggerFor > 0;
         const fMax = hurt ? 100 : 70;
         fx = clamp(130 * (f.anchor[0] - px) - 70 * vxx, -fMax, fMax);
@@ -556,6 +611,7 @@ export class BoxingController {
         ty = clamp(-tiltK * zbx - 8 * wy, -tMax, tMax);
         tz = clamp(-8 * wz, -15, 15);
       }
+      }
       const kb = this.knockback[side];
       if (kb) {
         if (this.time > kb.until) this.knockback[side] = null;
@@ -567,8 +623,26 @@ export class BoxingController {
       d.xfrc_applied[xfo + 3] = tx; d.xfrc_applied[xfo + 4] = ty; d.xfrc_applied[xfo + 5] = tz;
     }
 
-    // ---------------- hit detection + fall/KO ----------------
-    this.detectHits();
+      if (this.fighters.A.tracking || this.fighters.B.tracking) {
+        // 僵局检测：接触漂移把双机推远后没有任何片段能拉近距离——
+        // 距离 >1.9m 持续 3s 就重开回合（回到标准 1.0m 站位）
+        const far = Math.hypot(d.xpos[3 * this.ids.pelvisA] - d.xpos[3 * this.ids.pelvisB],
+          d.xpos[3 * this.ids.pelvisA + 1] - d.xpos[3 * this.ids.pelvisB + 1]);
+        if (far > 1.9) {
+          this._farT += dt;
+          if (this._farT > 3) {
+            this._farT = 0;
+            this.events.push({ type: 'round', t: this.time, stalemate: true });
+            this.resetRound();
+            return;
+          }
+        } else {
+          this._farT = Math.max(0, this._farT - dt);
+        }
+      }
+
+      // ---------------- hit detection + fall/KO ----------------
+      this.detectHits();
     this.checkFall();
     for (const side of ['A', 'B']) {
       this.damage[side] = Math.max(0, this.damage[side] - 0.15 * dt);
@@ -645,7 +719,10 @@ export class BoxingController {
     if (this.koState) return;
     for (const side of ['A', 'B']) {
       const b = side === 'A' ? this.ids.pelvisA : this.ids.pelvisB;
-      if (this.data.xpos[3 * b + 2] < 0.45) {
+      // tracking mode: the punch clips' boxing stance dips to pelvis 0.487m —
+      // a wobbling crouch must not read as a fall; 0.40 still catches real ones
+      const zLine = this.fighters[side].tracking ? 0.40 : 0.45;
+      if (this.data.xpos[3 * b + 2] < zLine) {
         this.fighters[side].down = true;
         const winner = side === 'A' ? 'B' : 'A';
         this.koState = { side, t: this.time, winner };

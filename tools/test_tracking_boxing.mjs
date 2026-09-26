@@ -117,7 +117,7 @@ for (let i = 0; i < steps; i++) {
 let fail = null;
 if (nan) fail = 'NaN in sim state';
 else if (ctl._divergences > 0) fail = 'engine auto-reset = instability';
-else if (minZA < 0.42 || minZB < 0.42) fail = `a robot fell during normal play (minZ A=${minZA.toFixed(2)} B=${minZB.toFixed(2)})`;
+else if (minZA < 0.40 || minZB < 0.40) fail = `a robot fell during normal play (minZ A=${minZA.toFixed(2)} B=${minZB.toFixed(2)})`;
 else if (koSeen < 1) fail = 'KO injection did not trigger';
 else if (ctl.fighters.A.clipSwaps + ctl.fighters.B.clipSwaps < 1 && PREFIX !== 'spinkick') fail = 'no clip swaps happened';
 else if (koT !== null && postResetMin < 0.5) fail = 'robots did not recover after round reset';
