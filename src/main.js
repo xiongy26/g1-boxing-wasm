@@ -619,6 +619,14 @@ function frame(now) {
   }
 }
 
+// 图例首行标明当前模式（追踪/AMO），便于确认加载的是哪套控制
+{
+  const ml = document.getElementById('modeLine');
+  if (ml) ml.textContent = TRACKING
+    ? '追踪模式 · 29 DoF 片段策略（guard/jab/cross/hook）'
+    : 'AMO 模式 · 23 DoF 全身策略';
+}
+
 refreshScore();
 banner('ROUND 1<br><span class="small">Fight!</span>', 1600);
 let lastFrameAt = 0;
