@@ -21,6 +21,8 @@ const MIME = {
 };
 
 http.createServer((req, res) => {
+  // 策略/场景更新频繁：一律禁缓存，避免浏览器拿到旧策略看不到新动作
+  res.setHeader('Cache-Control', 'no-cache');
   const urlPath = decodeURIComponent(new URL(req.url, 'http://x').pathname);
   let file = path.normalize(path.join(root, urlPath));
   if (!file.startsWith(root)) { res.writeHead(403); res.end(); return; }
