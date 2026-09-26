@@ -583,8 +583,8 @@ export class BoxingController {
           const R = d.xmat, o = 9 * b;
           const w = this.freeDof[side] + 3;
           const wx = d.qvel[w], wy = d.qvel[w + 1], wz = d.qvel[w + 2];
-          tx = clamp(100 * R[o + 5] - 8 * wx, -55, 55);
-          ty = clamp(-100 * R[o + 2] - 8 * wy, -55, 55);
+          tx = clamp(150 * R[o + 5] - 10 * wx, -70, 70);
+          ty = clamp(-150 * R[o + 2] - 10 * wy, -70, 70);
           tz = clamp(-8 * wz, -15, 15);
           // 缠斗分离：punch 片段只拉近距离（cross 前冲 0.8m），守卫片段原地——
           // 没有东西能拉开距离，贴身后必然缠倒。距离 <0.55m 时给双方一个
