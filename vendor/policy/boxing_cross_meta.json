@@ -1,6 +1,6 @@
 {
  "format": "tracking_v1",
- "source": "/home/xy/zcode/g1-boxing-wasm/.workbuddy/gpu/g1_boxing_task/logs/rsl_rl/g1_boxing/2026-09-25_02-00-06//2026-09-25_02-00-06.onnx",
+ "source": ".workbuddy/gpu/g1_boxing_task/logs/rsl_rl/g1_boxing/2026-09-26_11-18-18/2026-09-26_11-18-18.onnx",
  "obs_dim": 154,
  "num_joints": 29,
  "num_bodies": 14,

@@ -11,7 +11,7 @@ LOG=/tmp/finish_training.log
 log() { echo "[$(date '+%m-%d %H:%M:%S')] $*" >> "$LOG"; }
 
 find_rundir() { # clip-motion-name
-  for d in $(ls -td "$TRAIN_DIR"/logs/rsl_rl/g1_boxing/*/ 2>/dev/null); do
+  for d in $(ls -td "$TRAIN_DIR"/logs/rsl_rl/g1_boxing/*/ 2>/dev/null); do [ -d "$d" ] || continue
     if grep -aq "boxing_$1.npz" "$d/params/env.yaml" 2>/dev/null; then echo "$d"; return 0; fi
   done
   return 1
@@ -32,6 +32,7 @@ train_resume() { # clip envs load_run ckpt budget   — 前台运行，直到该
 deploy_and_test() { # clip
   local clip=$1 rundir onnx
   rundir=$(find_rundir "boxing_$clip")
+  log "deploy $clip: rundir=$rundir"
   onnx=$(ls -t "$rundir"/*.onnx 2>/dev/null | head -1)
   [ -n "$onnx" ] || { log "deploy $clip: no ONNX in $rundir"; return 1; }
   log "deploy $clip from $onnx"
