@@ -24,6 +24,13 @@ http.createServer((req, res) => {
   // 策略/场景更新频繁：一律禁缓存，避免浏览器拿到旧策略看不到新动作
   res.setHeader('Cache-Control', 'no-cache');
   const urlPath = decodeURIComponent(new URL(req.url, 'http://x').pathname);
+  // 老页面的 index.html 可能被浏览器长期缓存（历史响应没带禁缓存头）——
+  // 把 "/" 302 到带版本号的地址，强制一次缓存未命中，此后 no-cache 接管
+  if (urlPath === '/') {
+    res.writeHead(302, { Location: '/index.html?v=3', 'Cache-Control': 'no-store' });
+    res.end();
+    return;
+  }
   let file = path.normalize(path.join(root, urlPath));
   if (!file.startsWith(root)) { res.writeHead(403); res.end(); return; }
   if (file.endsWith(path.sep) || urlPath === '/') file = path.join(root, 'index.html');
