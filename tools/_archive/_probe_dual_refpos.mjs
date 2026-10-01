@@ -108,7 +108,17 @@ try {
 }
 
 ctl.setTracking('A', nets);
-ctl.setTracking('B', nets);
+// PROBE: A spawned at the reference's world x/y (position-sensitivity test);
+// B left untracked/frozen far away.
+{
+  const f = ctl.fighters.A.tracking;
+  const ref0 = f.net.refAt(0);
+  f.data.qpos[f.freeQpos + 0] = ref0.body_pos_w[0];
+  f.data.qpos[f.freeQpos + 1] = ref0.body_pos_w[1];
+  f.data.qpos[f.freeQpos + 2] = ref0.body_pos_w[2];
+  ctl.mujoco.mj_forward(ctl.model, ctl.data);
+}
+// ctl.setTracking('B', nets);
 console.log('tracking mode on: A + B');
 
 const DT = model.opt.timestep;

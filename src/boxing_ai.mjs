@@ -19,21 +19,38 @@
 // Hits are detected from real contacts: glove spheres vs opponent head/torso.
 
 import { AMOFighter, POLICY_JOINTS, DEFAULT_POSE, KP, KD, TORQUE_LIM } from './rl_policy.mjs';
-import { TrackingFighter } from './tracking_policy.mjs';
+import { TrackingFighter, yawOfQuat } from './tracking_policy.mjs';
 import { OBS_DIM, TACTIC_ACTIONS, ACTION_COMBOS } from './tactics.mjs';
 
 // tactic decision -> tracking clip name (stage-4 motion layer). Footwork/idle
 // states ride the looping guard clip; attacks trigger their punch clip.
+// §4.2: 追踪片段策略尚未训练步法指令，footwork 仍映射 guard；新增指令必须在
+// 训练中出现后才允许传入运动层（plan-realistic-boxing §4.2）。
 const TACTIC_CLIP = {
   approach: 'guard', retreat: 'guard', strafe_left: 'guard', strafe_right: 'guard',
   wait: 'guard',
   jab: 'jab', double: 'jab', cross: 'cross', hook: 'hook',
 };
 
+// 拳法片段启用门禁（临时）：现有拳法权重在真实切换中存活余量不足——jab/hook
+// fresh-RSI 起步 minZ 仅 0.481，任何 1° 级基座残差都会翻倒（机制 B，见
+// docs/stage4-tracking-notes.md 2026-09-28 节；hook 槽位即 jab 权重复制品）；
+// cross 干净 RSI 虽有 0.578 余量，但活体接触下 2 次执行摔 1 次（seed 3 B@9.0
+// 切换即倒），2026-09-28 队长决策一并禁用。全部拳法片段临时禁用，决策层
+// 映射回 guard，待 v3 片段重训后逐个恢复——验收门槛：无辅助单机 RSI
+// minZ≥0.55 + 双机三次 seed 回归无切换摔倒。
+const CLIP_ENABLED = { guard: true, jab: false, cross: false, hook: false, combo: true };
+
+// combo 槽位（plan-revamp-20260928 §5.2 D5-D8）：35s 连续拳击组合的单策略
+// 常驻循环。COMBO_MODE 下跳过 tactics 采样/拳法门禁/KO 与回合系统；
+// 非 combo 模式下该键不参与任何决策（TACTIC_CLIP 不产出 combo）。
+const PUNCH_CLIP = { jab: true, double: true, cross: true, hook: true, combo: true };
+
 // pelvis-to-pelvis distance window at which a punch clip may START. The punch
 // motions carry forward drive (jab ~0.2m, cross/hook ~0.8-1.0m): firing them
 // point-blank turns the lunge into a body-check tangle, firing them too far
 // is a whiff-charge. Outside the window the scheduler plays guard instead.
+// §4.2 标定：切片元数据携带实测 punch_range_m 时优先采用（punchRangeFor）。
 const PUNCH_RANGE = {
   // 标定（拳-头最小距离 vs 起始间距）：单方面出拳够不着（0.49m@0.7m 间距），
   // 命中发生在双方面互刺、各自前倾 0.2-0.4m 的交换里——窗口收窄到接触带
@@ -42,7 +59,107 @@ const PUNCH_RANGE = {
   hook: [0.85, 1.08],
 };
 
+// §4.4 出拳意图的有效期：排队后在这个时间内没到合适距离就取消，防止一个
+// 永远打不出去的拳法把步法决策饿死（"拳法请求长期阻塞移动"）。
+const PUNCH_INTENT_TTL = 1.6;
+// §4.4 出拳节奏：回合开始后的稳定期（策略从关键帧出生需要先站稳）+ 两次
+// 出拳之间的最短间隔——防止出拳请求连发把节奏变成冲撞推挤。
+const PUNCH_SETTLE_T = 2.5;
+const PUNCH_COOLDOWN = 0.5;
+// §4.4 允许从守卫循环提前切入的拳法：只放开低前冲的刺拳（前冲 ~0.2m，
+// 试探拳）。cross/hook 前冲 0.4-1.0m，在出生间距就提前发动会变成冲撞顶人
+// ——等阶段 A 重训片段携带实测 punch_range_m 后再逐拳放开（§4.2 标定）。
+const PUNCH_EARLY_EXIT = { jab: true };
+// §4.5 有效命中的拳速门槛 (m/s, ~60ms EMA)：真出拳 2-4 m/s，贴身挤压/漂移
+// 接触 <0.5 m/s。低于门槛的接触记为 graze（不计分不伤害）。
+const HIT_MIN_FIST_SPEED = 0.8;
+// §4.2 朝向指令的转速上限 (rad/s)：避免朝向目标突然跳变。
+const FACE_YAW_RATE = 2.5;
+// FIGHT_MODE（Q6 裁决）：60s 单回合循环——超时即重开回合，无局数上限；KO
+// 摔倒路径经 koState 结算后同样回到 resetRound。训练侧 episode 保持 10s 不变。
+const FIGHT_ROUND_S = 60;
+
+// FIGHT 反镜像（终审 P1 第 2 轮根因修复）：镜像出生 + 共享策略 + 对称观测 +
+// 确定性物理 = 确定性镜像锁定（zA===zB 逐位相等、同步双倒、零命中）。训练
+// 侧靠 obs 噪声 + RSI 位姿随机化 + push 事件打破对称——浏览器全确定性零打破。
+// 以下两个确定性扰动表是 RSI 随机化的等价物（按回合序号循环取值，可复现）：
+const FIGHT_PHASE_OFFSETS = [30, 55, 15, 40];   // B 机片段起始帧偏移（50fps → 0.3-1.1s），A 恒 0
+// B 机出生位抖动（|yaw|≤0.02rad、|Δpos|≤0.02m，次级扰动与相位偏移共同作用）
+const FIGHT_SPAWN_JITTER = [
+  { dx: 0.000, dy: 0.000, yaw: 0.020 },
+  { dx: 0.014, dy: 0.014, yaw: -0.020 },
+  { dx: -0.020, dy: 0.000, yaw: 0.000 },
+  { dx: 0.000, dy: -0.020, yaw: 0.015 },
+];
+
+// FIGHT PD 目标位置夹紧窗（P-A，终审第 3 轮）：复刻训练侧 position actuator
+// 的 ctrlrange 夹紧——训练 ctrl 目标被 mjlab 软窗夹住，浏览器 JS PD 原本无
+// 此约束（力矩限幅是另一回事，勿与 TRACKING_TORQUE_LIM 混淆）。
+// 来源：训练侧编译后模型真值 dump
+// .workbuddy/gpu/logs/sparring_model_dump.json（Unitree-G1-Sparring-P2 play
+// env → sim.mj_model，robot/ 侧 29 actuator；opponent/ 侧逐项一致已核对）。
+// dump md5 = 21f3937166bee2dd0d48143e5f58aac1（2026-09-29 导出）。
+// 顺序 = meta.joint_names（观测/动作序）。仅 fight 构造点传入，A/B 共用
+// （两机同构、窗对称已含左右差异）。
+const FIGHT_CTRL_RANGE = new Float32Array([
+  -4.720885851964, 5.069985851964,   // left_hip_pitch_joint
+  -1.926245865515, 4.369745865515,   // left_hip_roll_joint
+  -4.947785851964, 4.947785851964,   // left_hip_yaw_joint
+  -1.489912865515, 4.282445865515,   // left_knee_joint
+  -2.626979255693, 2.277909255693,   // left_ankle_pitch_joint
+  -2.016109255693, 2.016109255693,   // left_ankle_roll_joint
+  -4.720885851964, 5.069985851964,   // right_hip_pitch_joint
+  -4.369745865515, 1.926245865515,   // right_hip_roll_joint
+  -4.947785851964, 4.947785851964,   // right_hip_yaw_joint
+  -1.489912865515, 4.282445865515,   // right_knee_joint
+  -2.626979255693, 2.277909255693,   // right_ankle_pitch_joint
+  -2.016109255693, 2.016109255693,   // right_ankle_roll_joint
+  -4.808185851964, 4.808185851964,   // waist_yaw_joint
+  -2.274309255693, 2.274309255693,   // waist_roll_joint
+  -2.274309255693, 2.274309255693,   // waist_pitch_joint
+  -4.843509255693, 4.424709255693,   // left_shoulder_pitch_joint
+  -3.342509255693, 4.005809255693,   // left_shoulder_roll_joint
+  -4.372309255693, 4.372309255693,   // left_shoulder_yaw_joint
+  -2.801509255693, 3.848709255693,   // left_elbow_joint
+  -3.726529255693, 3.726529255693,   // left_wrist_roll_joint
+  -1.912433481318, 1.912433481318,   // left_wrist_pitch_joint
+  -1.912433481318, 1.912433481318,   // left_wrist_yaw_joint
+  -4.843509255693, 4.424709255693,   // right_shoulder_pitch_joint
+  -4.005809255693, 3.342509255693,   // right_shoulder_roll_joint
+  -4.372309255693, 4.372309255693,   // right_shoulder_yaw_joint
+  -2.801509255693, 3.848709255693,   // right_elbow_joint
+  -3.726529255693, 3.726529255693,   // right_wrist_roll_joint
+  -1.912433481318, 1.912433481318,   // right_wrist_pitch_joint
+  -1.912433481318, 1.912433481318,   // right_wrist_yaw_joint
+]);
+
+// 可复现回归用的确定性 RNG（mulberry32）。测试通过 controller rng 选项注入，
+// 默认 Math.random 保持旧行为。
+export function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+
+// 守卫片段的参考姿态是否回到与目标片段书端一致的站架：参考关节与目标片段
+// 帧 0 的无穷范数 < 0.035 rad。§4.4 守卫提前切换的触发条件。对比目标片段
+// 帧 0（而非网络默认姿态）使 v3 拳击架势书端的片段同样适用——切换条件就是
+// "参考不会跳变"。
+function nearGuardPose(net, step, targetNet) {
+  const ref = net.refAt(step);
+  const t0 = targetNet.refAt(0);
+  for (let i = 0; i < net.nq; i++) {
+    const d = ref.joint_pos[i] - t0.joint_pos[i];
+    if (d > 0.035 || d < -0.035) return false;
+  }
+  return true;
+}
 
 // AMO arm targets (8): [L_sp, L_sr, L_sy, L_elbow, R_sp, R_sr, R_sy, R_elbow].
 // Guard = AMO default pose. Jab poses verified stable in the headless pipeline.
@@ -138,7 +255,7 @@ function addOffsets(base, offs, k) {
 
 // ---- fighter ----------------------------------------------------------------
 class Fighter {
-  constructor(side, anchor0) {
+  constructor(side, anchor0, rng = Math.random) {
     this.side = side;
     this.forward = side === 'A' ? 1 : -1;      // A walks +x, B walks -x
     this.faceYaw = side === 'A' ? 0 : Math.PI; // absolute yaw command toward opponent
@@ -146,14 +263,15 @@ class Fighter {
     this.anchor = [...anchor0];
     this.state = 'idle';
     this.stateT = 0;
-    this.idleFor = 0.7 + Math.random() * 0.6;
+    this.idleFor = 0.7 + rng() * 0.6;
     this.combo = null;
     this.seqIdx = 0;
     this.phaseT = 0;
     this.phaseDur = 0;
     this.staggerFor = 0;
     this.down = false;
-    this.bobPhase = Math.random() * 6.28;
+    this.bobPhase = rng() * 6.28;
+    this.rng = rng;
     this.scores = { hits: 0, points: 0 };
     this._ppos = null;
     this.opponent = null;
@@ -166,28 +284,70 @@ class Fighter {
     this._obsPrev = { dist: null, t: null, fistL: null, fistR: null };
     this.tracking = null;    // TrackingFighter when clip-tracking mode is on
     this.trackingClips = null; // {guard,jab,cross,hook} -> TrackingNetwork
+    this.clipMeta = null;    // {clip -> motion.clip 元数据}（有效出拳区间等，可空）
     this.clip = null;        // currently playing clip
     this.desiredClip = null; // clip the tactics layer wants next
     this.clipSwaps = 0;
+    // §4.4 离散出拳请求：{clip, t}，与连续步法决策分开排队；带 TTL 防饿死
+    this.punchIntent = null;
+    // §4.5 出拳事件去重：每次出拳片段执行/组合步递增，一次出拳只计一分
+    this.punchEventId = 0;
+    this.lastScoredPunch = -1;
+    this.lastPunchEnd = -1e9;   // 上一次出拳片段结束的时刻（出拳冷却用）
+    this.noPunchUntil = -1e9;   // 出拳禁止窗口（回合稳定期 + 片段间冷却）
+    this.fistSpeed = { left: 0, right: 0 };   // EMA 拳速 (m/s)，命中判定用
+    this._fistPrev = { left: null, right: null, t: null };
   }
 }
 
 // ---- controller -------------------------------------------------------------
 export class BoxingController {
-  constructor(model, data, { mujoco, ids, assist = true, aggression = 1 }) {
+  constructor(model, data, { mujoco, ids, assist = true, aggression = 1, rng = Math.random, trackingAssist = false, comboMode = false, faceoff = false, fightMode = false }) {
     this.model = model;
     this.data = data;
     this.mujoco = mujoco;
     this.ids = ids;
     this.assist = assist;
+    // FIGHT_MODE（plan-fight-20260929 §5.2 W3）：?scene=tracking&fight=1 真实
+    // 对打——两台 G1 共享 168 维观测（含 opponent_state 14 维）的 fight 策略
+    // 自主对打，KO/回合重置/记分全启用（不进下方 comboMode 的 KO 禁用分支，
+    // checkFall tracking 阈 0.40 与训练侧 fall 终止同口径）。独立开关且优先
+    // 于 combo（URL 契约 §5.1：同给时 fight 优先，此处归一化兜底）；faceoff
+    // 是 combo 子选项，fight 下强制关。
+    this.fightMode = fightMode;
+    // COMBO_MODE（plan-revamp-20260928 §5.2）：两个拳手常驻循环 combo 片段，
+    // 禁 KO 与回合重置（连续观察 N1）。默认 false，不影响既有路径。
+    this.comboMode = comboMode && !fightMode;
+    // faceoff（Phase 2，2026-09-29）：combo 子选项（?combo=1&faceoff=1）——B 侧
+    // 按 rebaseYawDelta 重锚定（出生朝向 π − combo ref0 yaw −0.81 = −2.33 rad），
+    // 180° 面向 A 成真对抗站位；A 侧保持 delta=0。依赖 TrackingFighter 的
+    // faceoff 修正公式（世界系 Rz 前乘；遗留体轴后乘对带俯仰的 ref 不守恒，
+    // anchor_ori 观测泄漏 0.645，见 tracking_policy.mjs）。默认 false：
+    // delta=0 + 遗留公式，已交付路径字节不变。头less 验证（iter-6000 权重）：
+    // 单机 B 30s PASS minZ=0.595、双机 30s PASS minZ=0.647、各 2 次回绕
+    // （tools/_probe_faceoff.mjs obsdiff：全 154 维观测+动作与 delta=0 逐位相同）。
+    this.faceoffMode = faceoff && !fightMode;
+    // fight 60s 回合计时（Q6）：resetRound 归零
+    this._roundT = 0;
+    // FIGHT 反镜像（见 FIGHT_PHASE_OFFSETS）：回合序号与 B 机相位/出生抖动
+    // 状态。boot = 第 0 回合（相位表[0]=30）；resetRound 递增循环取值。
+    // 非 fight 模式这两个状态只被写不被读。
+    this._roundNo = 0;
+    this._fightPhase = { A: 0, B: FIGHT_PHASE_OFFSETS[0] };
+    // §4.6：追踪片段策略是无外力训练的，外部扶正/阻尼与片段动力学直接对抗
+    // （实测真辅助让出拳段摔得更快）。默认关断，只对脚本回退模式生效；
+    // 将来训练"带辅助课程"的策略后再开（trackingAssist=true）。
+    this.trackingAssist = trackingAssist;
     this.aggression = aggression;
+    this.rng = rng;
     this.fighters = {};
     for (const side of ['A', 'B']) {
       const b = side === 'A' ? ids.pelvisA : ids.pelvisB;
-      this.fighters[side] = new Fighter(side, [data.xpos[3 * b], data.xpos[3 * b + 1]]);
+      this.fighters[side] = new Fighter(side, [data.xpos[3 * b], data.xpos[3 * b + 1]], rng);
     }
     this.fighters.A.opponent = this.fighters.B;
     this.fighters.B.opponent = this.fighters.A;
+    for (const side of ['A', 'B']) this.fighters[side].noPunchUntil = PUNCH_SETTLE_T;
 
     // actuator ids in POLICY_JOINTS order, per side
     this.actIdx = {};
@@ -202,8 +362,17 @@ export class BoxingController {
     }
     this.freeDof = {};
     for (const side of ['A', 'B']) {
-      const j = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT.value, side + '_pelvis');
-      this.freeDof[side] = model.jnt_dofadr[j];
+      // 通过骨盆 body 的第一个关节解析自由关节（2026-09-26 修复：原先按 AMO
+      // 场景的关节名 side_pelvis 解析，追踪场景的自由关节叫
+      // side_floating_base_joint → id=-1 → qvel 读出 undefined → NaN 污染
+      // 辅助力输出，追踪模式的辅助自上线以来静默失效——辅助开/关轨迹完全
+      // 相同即此症状）。
+      const pbody = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY.value, side + '_pelvis');
+      const pj = pbody >= 0 ? model.body_jntadr[pbody] : -1;
+      if (!(pj >= 0) || model.jnt_type[pj] !== mujoco.mjtJoint.mjJNT_FREE.value) {
+        throw new Error('pelvis freejoint not found for side ' + side);
+      }
+      this.freeDof[side] = model.jnt_dofadr[pj];
     }
 
     const gid = n => mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM.value, n);
@@ -227,6 +396,13 @@ export class BoxingController {
     this._lastSimTime = -1;
     this._divergences = 0;
     this._farT = 0;   // 追踪模式僵局计时：双机距离过远且无法拉近时重置回合
+    // §4.6 辅助用量计量：|力|(N·s) 与 |力矩|(N·m·s) 的积分，验收时报告
+    // "外部辅助力与力矩的使用量"，避免辅助掩盖失败。
+    this.assistUsage = {
+      A: { fx: 0, fy: 0, fz: 0, tx: 0, ty: 0, tz: 0 },
+      B: { fx: 0, fy: 0, fz: 0, tx: 0, ty: 0, tz: 0 },
+    };
+    this._lastAssistSample = { t: 0, A: null, B: null };
   }
 
   // ---- AMO mode ---------------------------------------------------------------
@@ -254,14 +430,62 @@ export class BoxingController {
   setTracking(side, nets) {
     this.clearTracking(side);
     const f = this.fighters[side];
+    // 第二层闸门（审查建议）：fightMode 开着但本次挂载的栈没有 fight 槽
+    // （回退后重开 / API 误用）——就地归一化回默认追踪语义，避免 fight
+    // 短路分支撞上不存在的 guard 槽位形成混合语义。
+    if (this.fightMode && !nets.fight) this.fightMode = false;
     f.trackingClips = nets;
-    // B faces yaw π; the clips are baked at yaw 0 — mirror the reference
-    // heading for B (the policy is yaw-invariant, see TrackingFighter)
-    f.tracking = new TrackingFighter(this.mujoco, this.model, this.data, side, nets.guard,
-      side === 'B' ? { yawOffset: Math.PI } : {});
+    // 切片元数据（cut_boxing_clips.py 导出、extract_tracking_onnx.py 注入到
+    // policy meta 的 motion.clip 字段）：有效出拳区间/出手窗口/来源。缺失时
+    // 调度器回退到内建标定值。
+    f.clipMeta = {};
+    for (const [name, net] of Object.entries(nets)) {
+      f.clipMeta[name] = net.meta?.motion?.clip ?? null;
+    }
+    // COMBO_MODE 且 combo 权重已部署：常驻循环从 combo 片段起步；FIGHT_MODE
+    // 走单策略 fight 槽（168 维对打权重，boxing_ai 侧无片段库语义）；否则回退
+    // 既有 guard 起步行为（combo=1 无权重时优雅降级，不破坏默认模式）。
+    const startClip = this.fightMode && nets.fight ? 'fight'
+      : this.comboMode && nets.combo ? 'combo' : 'guard';
+    const startNet = nets[startClip];
+    if (!startNet) throw new Error('tracking stack needs a ' + startClip + ' policy');
+    // 重锚定角统一公式替换硬编码 π：初始时机器人 torso 在出生朝向（A≈0、
+    // B≈π），guard ref0 yaw=0 → Δ_A≈0、Δ_B≈π，行为兼容。
+    // COMBO 模式锁 delta=0（2026-09-29 实测裁决）：非零 yaw 重锚定对该策略
+    // 致命（观测虽理论相消，实测 0.81 rad 偏移 1.5s 内倒地；delta=0 则 42s
+    // 三回绕稳定）。默认 guard 路径仍用计算 delta（字节级行为不变）。
+    // faceoff=1 时仅 B 侧例外（comboDelta：重锚定回出生朝向 π，配合
+    // TrackingFighter faceoff 修正公式，_probe_faceoff 已验证 30s 站立）。
+    // fight 走计算 delta（rebaseYawDelta）：出生朝向与 fight 参考起始帧 yaw
+    // 对齐，启动/回绕/回合重置三处同一公式，anchor-ori 观测在重锚定瞬间归零。
+    // 反镜像：B 机参考起始帧 = 本回合相位偏移（_fightPhase，A 恒 0）——训练
+    // RSI 随机起始帧的确定性等价物，打破双机镜像锁定。
+    const phase = startClip === 'fight' ? this._fightPhase[side] : 0;
+    const delta = startClip === 'combo' ? this.comboDelta(side, startNet) : this.rebaseYawDelta(side, startNet, phase);
+    // faceoff 修正公式（世界系 Rz 前乘）在 fight 下双侧启用：fight 重锚定角
+    // 非零（B≈π、A=−ref0 yaw），且 fight ref0 基座可能带俯仰——遗留体轴后乘
+    // 与 policyTick 观测旋转（Rz 前乘）不互逆，anchor-ori 观测会泄漏（
+    // _probe_faceoff 实测 0.645 的同款机制）。δ=0 时两式恒等，旧路径不受影响。
+    f.tracking = new TrackingFighter(this.mujoco, this.model, this.data, side, startNet,
+      { yawOffset: delta, faceoff: this.fightMode || (this.faceoffMode && side === 'B'),
+        opponent: f.opponent?.tracking ?? null,
+        // P-A：fight 才带 ctrlrange 目标夹紧窗（guard/combo null = 不夹紧）
+        ctrlRange: startClip === 'fight' ? FIGHT_CTRL_RANGE : null });
     f.tracking.reset(0);
-    f.clip = 'guard';
-    f.desiredClip = 'guard';
+    if (startClip === 'combo' || startClip === 'fight') {
+      // 组合/对打片段帧 0 非场景关键帧书端：启动即原位重锚定到参考起始帧——
+      // 训练回合起点的 RSI 等价物（sparring 训练 reset 同样由 RSI 摆位，见
+      // sparring_env_cfgs.py：robot 出生由 MotionCommand RSI 覆盖）。
+      // 默认 guard 路径保持原状（书端≈关键帧，字节级行为不变）。
+      f.tracking.rebaseToReference(delta, phase);
+      // FIGHT：B 机出生位抖动（次级反镜像扰动；内部守卫，combo/guard 空操作）
+      this._applyFightSpawnJitter(side);
+      // 出生间距隔离在 main.js 的 COMBO_MODE/FIGHT_MODE 场景加载替换中完成
+      // （±1.2m / ±0.6m），setTracking 不再做额外推挤。
+      this.mujoco.mj_forward(this.model, this.data);
+    }
+    f.clip = startClip;
+    f.desiredClip = startClip;
     f.amoName = 'tracking';
     return f.tracking;
   }
@@ -270,8 +494,10 @@ export class BoxingController {
     const f = this.fighters[side];
     f.tracking = null;
     f.trackingClips = null;
+    f.clipMeta = null;
     f.clip = null;
     f.desiredClip = null;
+    f.punchIntent = null;
     if (f.amoName === 'tracking') f.amoName = null;
   }
 
@@ -288,6 +514,89 @@ export class BoxingController {
 
   // 13-dim normalized observation, self-centered & mirrored (policy can play
   // either side). See OBS_DIM in tactics.mjs for the layout.
+  // §4.2 距离标定：优先使用切片元数据的实测 punch_range_m（按拳法区分前冲
+  // 距离），缺失时回退到内建标定窗口。
+  punchRangeFor(f, clip) {
+    const m = f.clipMeta?.[clip];
+    if (m && Array.isArray(m.punch_range_m)) return m.punch_range_m;
+    return PUNCH_RANGE[clip] ?? [0.82, 1.08];
+  }
+
+  // combo 槽位重锚定角（faceoff 子选项）：默认（含 faceoffMode=false）恒 0，
+  // 与 2026-09-29 的"COMBO 锁 delta=0"裁决字节一致；faceoff=1 时仅 B 侧按
+  // rebaseYawDelta 计算（出生朝向 π − combo ref0 yaw ≈ −2.33 rad，转身面向
+  // A），A 侧保持 0。B 侧 fighter 同时携带 faceoff 标志走世界系 Rz 修正。
+  comboDelta(side, net) {
+    if (!this.faceoffMode || side !== 'B') return 0;
+    return this.rebaseYawDelta(side, net);
+  }
+
+  // FIGHT 反镜像：按回合序号更新 B 机片段起始帧偏移（A 恒 0）。boot（构造
+  // 后 _roundNo=0）与每次 resetRound 调用；表长 4 循环，确定性可复现。
+  _assignFightPhase() {
+    this._fightPhase.B = FIGHT_PHASE_OFFSETS[this._roundNo % FIGHT_PHASE_OFFSETS.length];
+  }
+
+  // FIGHT 反镜像次级扰动：B 机出生位抖动（±0.02m 平移 + ±0.02rad yaw，按回
+  // 合序号循环）。必须在 rebaseToReference 之后、mj_forward 之前调用（rebase
+  // 保留 keyframe 出生 x/y，抖动在其上叠加）。三重守卫：fightMode + fight 槽
+  // + 仅 B 机——combo/default/A 侧零触碰。yaw 用世界系 Rz 前乘（wxyz
+  // Hamilton，与 rebaseToReference 的 _faceoffFix 修正式同约定）。
+  _applyFightSpawnJitter(side) {
+    if (!this.fightMode || side !== 'B') return;
+    const f = this.fighters[side];
+    if (!f.tracking || !f.trackingClips?.fight) return;
+    const j = FIGHT_SPAWN_JITTER[this._roundNo % FIGHT_SPAWN_JITTER.length];
+    const q = f.tracking.freeQpos, d = this.data;
+    d.qpos[q + 0] += j.dx;
+    d.qpos[q + 1] += j.dy;
+    if (j.yaw) {
+      const zw = Math.cos(j.yaw / 2), zz = Math.sin(j.yaw / 2);
+      const w = d.qpos[q + 3], x = d.qpos[q + 4], y = d.qpos[q + 5], z = d.qpos[q + 6];
+      d.qpos[q + 3] = zw * w - zz * z;
+      d.qpos[q + 4] = zw * x - zz * y;
+      d.qpos[q + 5] = zw * y + zz * x;
+      d.qpos[q + 6] = zw * z + zz * w;
+    }
+  }
+
+  // 重锚定角 Δ = 当前机器人 torso 实际 yaw − 目标片段参考起始帧 torso yaw
+  // （startStep 默认 0 = 既有 ref0 语义；fight 相位偏移传非零帧，使重锚定
+  // 瞬间 anchor-ori 观测归零的基准帧与 rebaseToReference 的起始帧一致）。
+  // 各片段烘焙的世界朝向不一致（guard 0° / cross −15.3° / jab、hook
+  // −161.8°），调度器不能假设所有片段共享世界约定。Δ 同时用于旋转参考
+  // （yawOffset）与原位重锚定（TrackingFighter.rebaseToReference）。yaw 必
+  // 须走 yawOfQuat（wxyz 四元数，归一化 (−π,π]）；需在 mj_forward / 仿真步
+  // 进之后调用（xquat 就绪）。
+  rebaseYawDelta(side, net, startStep = 0) {
+    const tb = this.mujoco.mj_name2id(this.model, this.mujoco.mjtObj.mjOBJ_BODY.value, side + '_torso_link');
+    if (tb < 0) throw new Error('torso body not found: ' + side);
+    const tq = this.data.xquat, o = 4 * tb;
+    const cur = yawOfQuat(tq[o], tq[o + 1], tq[o + 2], tq[o + 3]);
+    const ai = net.meta.body_names.indexOf(net.meta.anchor_body_name);
+    const r = net.refAt(startStep).body_quat_w, ro = 4 * ai;
+    const ref = yawOfQuat(r[ro], r[ro + 1], r[ro + 2], r[ro + 3]);
+    let delta = cur - ref;
+    delta = ((delta + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+    return delta;
+  }
+
+  // §4.4/§4.5 追踪模式下该拳手当前是否处于有效出拳阶段：优先用元数据的
+  // 出手窗口（秒，从片段起始计），缺失时只要有非守卫片段在播就算。
+  punchActive(f) {
+    // FIGHT_MODE：策略自主出拳，无片段/出手窗口语义——拳套接触一律进入有效
+    // 命中判定（真实出拳门槛 HIT_MIN_FIST_SPEED 仍在 registerHit 把关，避免
+    // 贴身挤压漂移接触刷分）。
+    if (this.fightMode) return !!f.tracking;
+    if (!f.tracking || f.clip === 'guard' || !PUNCH_CLIP[f.clip]) return false;
+    const m = f.clipMeta?.[f.clip];
+    if (m && Array.isArray(m.strike_window_s)) {
+      const t = f.tracking.timeStep / (f.tracking.net.meta.motion.fps || 50);
+      return t >= m.strike_window_s[0] && t <= m.strike_window_s[1];
+    }
+    return true;
+  }
+
   buildTacticsObs(side) {
     const d = this.data;
     const f = this.fighters[side], op = f.opponent;
@@ -332,19 +641,67 @@ export class BoxingController {
   decideTactics(f, dist) {
     const pol = this.tactics[f.side] ?? this.tactics; // per-side policies OR shared
     if (!pol || typeof pol.act !== 'function') return false; // this side: fallback
-    const obs = this.buildTacticsObs(f.side);
-    const { action } = pol.act(obs, { sample: true, temp: pol.tacticsTemp ?? this.tacticsTemp });
-    if (f.traj) f.traj.push({ t: this.time, obs: Array.from(obs), action });
-    const name = TACTIC_ACTIONS[action];
-    // tracking mode: the decision only queues the next clip — the motion layer
-    // executes it at the current clip's guard boundary. A queued/playing punch
-    // is never overwritten by later footwork decisions (queue lock), otherwise
-    // the rapid non-attack decisions starve punches out before the boundary.
+
+    // ---- tracking mode: 决策只排队下一个片段，运动层在守卫边界执行 ----
+    // §4.4 队列纪律：
+    //  - 片段播放中：队列锁死，不打断（出拳发力段不允许强行中断）；
+    //  - 出拳意图挂起：直接返回（不重新采样、不覆盖），由 update() 在距离
+    //    合适时执行；超过 TTL 仍未执行则取消，防止拳法请求长期阻塞移动；
+    //  - 空闲：采样一次决策，重置决策计时（修复：原先到达空闲阈值后每个
+    //    物理步都重新采样）。
     if (f.tracking) {
-      if (f.clip !== 'guard' || (f.desiredClip && f.desiredClip !== 'guard')) return true;
-      f.desiredClip = TACTIC_CLIP[name] ?? 'guard';
+      // FIGHT_MODE：对打无脚本编排（需求 F-7）——出拳/逼近由策略权重自主
+      // 决策，决策层只维持常驻 fight 片段，不采样战术、不排队拳法意图。
+      if (this.fightMode) {
+        f.desiredClip = f.clip;
+        return true;
+      }
+      // COMBO_MODE：组合循环常驻——跳过 tactics 采样与拳法门禁，desiredClip
+      // 恒为 combo（运动层在片段回绕处消费；无 combo 权重时守卫回退）。
+      if (this.comboMode) {
+        f.desiredClip = f.trackingClips.combo ? 'combo' : 'guard';
+        f.punchIntent = f.desiredClip === 'combo' ? { clip: 'combo', t: this.time } : null;
+        return true;
+      }
+      if (f.clip !== 'guard') return true;
+      if (f.desiredClip && f.desiredClip !== 'guard') {
+        if (f.punchIntent && this.time - f.punchIntent.t > PUNCH_INTENT_TTL) {
+          f.desiredClip = 'guard';
+          f.punchIntent = null;    // 意图过期：取消（§4.4）
+        }
+        return true;
+      }
+      const obs = this.buildTacticsObs(f.side);
+      const { action } = pol.act(obs, { sample: true, temp: pol.tacticsTemp ?? this.tacticsTemp, rng: f.rng });
+      if (f.traj) f.traj.push({ t: this.time, obs: Array.from(obs), action });
+      const name = TACTIC_ACTIONS[action];
+      let clip = TACTIC_CLIP[name] ?? 'guard';
+      // 追踪模式过渡语义（§4.2 缺位期）：步法决策全部映射原地守卫片段，
+      // "接近"没有可执行语义——在 jab 距离带内按先验本意（band 边缘用刺拳
+      // 试探）转为出拳，避免步法决策把出拳饿死。步法片段训练落地后移除。
+      const jr = this.punchRangeFor(f, 'jab');
+      if (!PUNCH_CLIP[clip] && (name === 'approach' || name === 'wait') &&
+          dist >= jr[0] && dist <= jr[1]) {
+        clip = 'jab';
+      }
+      // 拳法门禁（临时）：未启用片段映射回 guard，意图不入队
+      if (!CLIP_ENABLED[clip]) clip = 'guard';
+      if (PUNCH_CLIP[clip]) {
+        f.desiredClip = clip;
+        f.punchIntent = { clip, t: this.time };
+      } else {
+        f.desiredClip = 'guard';   // 步法决策不携带出拳请求
+        f.punchIntent = null;
+      }
+      f.stateT = 0;
+      f.idleFor = (0.25 + f.rng() * 0.3) / this.aggression;  // 限频：~2-3 决策/秒
       return true;
     }
+
+    const obs = this.buildTacticsObs(f.side);
+    const { action } = pol.act(obs, { sample: true, temp: pol.tacticsTemp ?? this.tacticsTemp, rng: f.rng });
+    if (f.traj) f.traj.push({ t: this.time, obs: Array.from(obs), action });
+    const name = TACTIC_ACTIONS[action];
     switch (name) {
       case 'approach':
         f.state = 'approach'; f.stateT = 0; f.phaseDur = 1.4; break;
@@ -355,10 +712,10 @@ export class BoxingController {
       case 'strafe_right':
         f.state = 'strafe'; f.strafeDir = -1; f.stateT = 0; f.phaseDur = 0.6; break;
       case 'wait':
-        f.stateT = 0; f.idleFor = 0.25 + Math.random() * 0.35; break; // hold guard, re-decide soon
+        f.stateT = 0; f.idleFor = 0.25 + f.rng() * 0.35; break; // hold guard, re-decide soon
       default: { // attack family -> concrete combo (side randomized for variety)
         const opts = ACTION_COMBOS[name] ?? [0];
-        f.combo = COMBOS[opts[Math.floor(Math.random() * opts.length)]];
+        f.combo = COMBOS[opts[Math.floor(f.rng() * opts.length)]];
         f.seqIdx = 0; f.phaseT = 0; f.state = 'windup'; f.phaseDur = 0.08;
       }
     }
@@ -389,7 +746,12 @@ export class BoxingController {
   }
 
   writeLimp(side) {
-    for (let i = 0; i < 23; i++) this.data.ctrl[this.actIdx[side][i]] = 0;
+    // §4.6 KO 断力矩必须覆盖该侧全部执行器：追踪场景 29 自由度含每臂 3 个
+    // 腕部执行器（共 6 个），只清 POLICY_JOINTS 的 23 个会让手腕保留最后的
+    // PD 力矩，KO 塌倒姿态不自然且可能撑住身体。
+    const f = this.fighters[side];
+    const list = f.tracking ? f.tracking.actId : this.actIdx[side];
+    for (let i = 0; i < list.length; i++) this.data.ctrl[list[i]] = 0;
   }
 
   pelvisPos(side) {
@@ -406,11 +768,24 @@ export class BoxingController {
         const f = this.fighters[side];
         f.state = 'idle'; f.stateT = 0; f.staggerFor = 0; f.combo = null;
         f._ppos = null; f.anchor = [...f.anchor0];
+        f.punchIntent = null; f.punchEventId = 0; f.lastScoredPunch = -1;
+        f.noPunchUntil = this.time + PUNCH_SETTLE_T;  // 回合稳定期
+        f.fistSpeed = { left: 0, right: 0 };
+        f._fistPrev = { left: null, right: null, t: null };
         if (f.amo) f.amo.reset();
-        if (f.tracking) { f.tracking.reset(0); f.clip = 'guard'; f.desiredClip = 'guard'; }
+        if (f.tracking) {
+          // COMBO_MODE：引擎时间回退的自愈重置也保持 combo 常驻片段；
+          // FIGHT_MODE 同理保持 fight 常驻片段（时钟回本回合相位帧，不回 0
+          // ——否则自愈一次就与 A 重新镜像同步）
+          const clip = this.fightMode && f.trackingClips.fight ? 'fight'
+            : this.comboMode && f.trackingClips.combo ? 'combo' : 'guard';
+          f.tracking.reset(clip === 'fight' ? this._fightPhase[side] : 0);
+          f.clip = clip; f.desiredClip = clip;
+        }
       }
       this.knockback = { A: null, B: null };
       this.koState = null;
+      this._roundT = 0;   // fight 60s 回合计时一并归零（引擎时间已回退，重开回合）
     }
     this._lastSimTime = d.time;
     this.time += dt;
@@ -424,6 +799,17 @@ export class BoxingController {
       }
       if (this.time - this.koState.t > 2.2) this.resetRound();
       return;
+    }
+
+    // FIGHT_MODE（Q6）：60s 单回合循环——超时即重开（无局数上限，比分累计
+    // 在 scores）。KO 摔倒路径经上方 koState 结算后同样回到 resetRound；
+    // _roundT 在 resetRound 归零。非 fight 模式不进此分支（零影响）。
+    if (this.fightMode) {
+      this._roundT += dt;
+      if (this._roundT >= FIGHT_ROUND_S) {
+        this.resetRound();
+        return;
+      }
     }
 
     // ---------------- behaviour ----------------
@@ -444,13 +830,37 @@ export class BoxingController {
         vy = 0.05 * Math.sin(this.time * 1.7 + f.bobPhase);
         if (f.stateT >= f.idleFor) {
           if (this.tactics && this.decideTactics(f, dist)) {
-            // learned tactic handled the decision
+            // learned tactic handled the decision (tracking: queue + reset timer;
+            // AMO/scripted: state transition)
+          } else if (f.tracking) {
+            // tracking mode without a tactics policy: weighted-random fallback
+            // queues clips directly (previously the tracking robot never punched)
+            if (this.fightMode) {
+              // fight 短路：无战术权重时也维持常驻 fight 片段（同 decideTactics
+              // 的 fight 分支——对打无脚本编排，不排队拳法）
+              f.desiredClip = f.clip;
+              f.stateT = 0;
+            } else if (this.comboMode) {
+              // COMBO_MODE 短路：不采样，直接常驻 combo（同 decideTactics）
+              f.desiredClip = f.trackingClips.combo ? 'combo' : 'guard';
+              f.punchIntent = f.desiredClip === 'combo' ? { clip: 'combo', t: this.time } : null;
+              f.stateT = 0;
+              f.idleFor = (0.25 + f.rng() * 0.3) / this.aggression;
+            } else {
+              const pick = weightedPick(COMBO_POOL, f.rng);
+              let clip = TACTIC_CLIP[pick] ?? 'guard';
+              if (!CLIP_ENABLED[clip]) clip = 'guard';   // 拳法门禁（临时）
+              f.desiredClip = clip;
+              f.punchIntent = PUNCH_CLIP[clip] ? { clip, t: this.time } : null;
+              f.stateT = 0;
+              f.idleFor = (0.25 + f.rng() * 0.3) / this.aggression;
+            }
           } else if (dist > 0.85) { f.state = 'approach'; f.stateT = 0; f.phaseDur = 1.4; }
           else if (dist < 0.42) { f.state = 'retreat'; f.stateT = 0; f.phaseDur = 0.5; }
           else {
-            const pick = weightedPick(COMBO_POOL, Math.random);
+            const pick = weightedPick(COMBO_POOL, f.rng);
             const opts = POOL_MAP[pick];
-            f.combo = COMBOS[opts[Math.floor(Math.random() * opts.length)]];
+            f.combo = COMBOS[opts[Math.floor(f.rng() * opts.length)]];
             f.seqIdx = 0; f.phaseT = 0; f.state = 'windup'; f.phaseDur = 0.08;
           }
         }
@@ -467,7 +877,7 @@ export class BoxingController {
         if (f.stateT >= f.phaseDur) { f.state = 'idle'; f.stateT = 0; f.idleFor = 0.2 + Math.random() * 0.3; }
       } else if (f.state === 'windup') {
         f.phaseT += dt;
-        if (f.phaseT >= f.phaseDur) { f.state = 'strike'; f.phaseT = 0; f.phaseDur = 0.22; }
+        if (f.phaseT >= f.phaseDur) { f.state = 'strike'; f.phaseT = 0; f.phaseDur = 0.22; f.punchEventId++; }
       } else if (f.state === 'strike') {
         f.phaseT += dt;
         const poseName = f.combo.seq[f.seqIdx];
@@ -492,36 +902,118 @@ export class BoxingController {
       }
       if (f.staggerFor > 0) { f.staggerFor -= dt; vx *= 0.2; vy = 0; }
 
+      // §4.5 拳速跟踪（短 EMA，时间常数 ~30ms）：有效命中判定用——真出拳
+      // 2-4 m/s，贴身挤压/漂移接触远低于此。
+      {
+        const P = d.site_xpos;
+        const fL = side === 'A' ? this.ids.fistLA : this.ids.fistLB;
+        const fR = side === 'A' ? this.ids.fistRA : this.ids.fistRB;
+        for (const [hand, sid] of [['left', fL], ['right', fR]]) {
+          const p = [P[3 * sid], P[3 * sid + 1], P[3 * sid + 2]];
+          const prev = f._fistPrev[hand];
+          const pdt = f._fistPrev.t === null ? 0 : this.time - f._fistPrev.t;
+          if (prev && pdt > 1e-5 && pdt < 0.2) {
+            const v = Math.hypot(p[0] - prev[0], p[1] - prev[1], p[2] - prev[2]) / pdt;
+            f.fistSpeed[hand] = 0.7 * f.fistSpeed[hand] + 0.3 * v;
+          }
+          f._fistPrev[hand] = p;
+        }
+        f._fistPrev.t = this.time;
+      }
+
+      // §4.2 持续面向对手：方位角指令平滑跟踪对手实际方位（限转速），替换
+      // 固定 0/π——接触漂移把双机推离初始连线后，旧指令会让机器人不再面向
+      // 对手。追踪模式不喂朝向指令（片段参考拥有航向，新指令必须先训练）。
+      if (f.amo) {
+        const bearing = Math.atan2(op[1] - me[1], op[0] - me[0]);
+        let dyaw = bearing - f.faceYaw;
+        dyaw = ((dyaw + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+        const maxStep = FACE_YAW_RATE * dt;
+        f.faceYaw += clamp(dyaw, -maxStep, maxStep);
+      }
+
       // ---- drive the robot ----
       if (f.tracking) {
-        // stage-4 motion layer: play the current clip; swap at its guard boundary.
-        // All clips bookend with the SAME guard stance, so the swap hands the
-        // previous fighter's last action / PD target straight to the new one
-        // (cross-fade-lite): zeroing them instead would snap the pose for one
-        // tick right as the punch clips head into their marginal deep stance.
+        // stage-4 motion layer: play the current clip; swap at its guard
+        // boundary. All clips bookend with the SAME guard stance. Switches use
+        // in-place rebase RSI (swapTo): joint/base state snaps to the new
+        // clip's frame-0 reference re-anchored at the robot's current heading —
+        // the exact state a training episode starts from. Clips bake different
+        // world yaws (guard 0° / cross −15.3° / jab、hook −161.8°)，不重锚定的
+        // 话 anchor-ori 观测在切换瞬间带恒定 162-198° 误差，策略分布外摔倒。
+        const swapTo = (want) => {
+          // Δ 同时驱动参考旋转（yawOffset）与机器人状态重锚定，两者相消使
+          // 切换瞬间 anchor-ori 观测归零。lastAction/pdTarget 归零而非接续
+          // prev：接续会把前一片段末端动作带进分布外起点，与训练回合起点
+          // 不一致（守卫循环内的 guard→guard 延续走 carryOver，不经此处）。
+          // COMBO 模式锁 delta=0（同 setTracking，实测非零 delta 致倒）。
+          // faceoff=1 时仅 B 侧例外（comboDelta），新 fighter 同步携带 faceoff
+          // 修正标志，回绕重锚定与观测旋转保持世界系 Rz 同约定。
+          // fight 回绕走 rebaseYawDelta（当前朝向−参考起始帧 yaw），起始帧 =
+          // 本回合相位偏移——回绕不重置相位，否则与 A 重新镜像同步。
+          const phase = want === 'fight' ? this._fightPhase[side] : 0;
+          const delta = this.comboMode ? this.comboDelta(side, f.trackingClips[want]) : this.rebaseYawDelta(side, f.trackingClips[want], phase);
+          const nf = new TrackingFighter(this.mujoco, this.model, this.data, side,
+            f.trackingClips[want], { yawOffset: delta,
+              faceoff: this.fightMode || (this.faceoffMode && side === 'B'),
+              opponent: f.opponent?.tracking ?? null,
+              ctrlRange: want === 'fight' ? FIGHT_CTRL_RANGE : null });
+          nf.rebaseToReference(delta, phase);
+          this.mujoco.mj_forward(this.model, this.data);
+          f.tracking = nf;
+          f.clip = want;
+          f.clipSwaps++;
+          f.desiredClip = 'guard';  // 队列已消费（无论打没打）
+          if (PUNCH_CLIP[want]) f.punchEventId++;
+          else f.noPunchUntil = this.time + PUNCH_COOLDOWN;  // 出拳后冷却（§4.4 节奏）
+          // （fight 的 'fight' 槽不在 PUNCH_CLIP：走 else 分支设 noPunchUntil，
+          // 该计时在 fight 路径无消费者——回绕分支与 punchActive 均不看它，
+          // 命中控频由 registerHit 的 hitCooldown 承担。）
+          f.punchIntent = null;
+        };
+        const carryOver = () => {
+          // guard→guard 循环：原地重启参考时钟（动作状态本就延续，无需拷贝；
+          // 历史版本的 prev 自拷贝 set 对同一对象是无操作，已删）
+          f.tracking.reset(0);
+        };
         if (f.tracking.clipDone) {
-          const prev = f.tracking;
+          // FIGHT_MODE：单策略常驻循环（训练 10s episode，参考播完即回绕）。
+          // 回绕 = 原位重锚定 RSI（swapTo 内 rebaseYawDelta：当前朝向−ref0
+          // yaw，重锚定瞬间 anchor-ori 观测归零，与守卫路径切换同语义）；
+          // 不走拳法距离门禁——对打出拳由策略权重自主驱动，无脚本编排。
+          if (this.fightMode && f.trackingClips.fight) {
+            swapTo('fight');
+            f.desiredClip = 'fight';   // 常驻循环：队列不被消费
+          } else if (this.comboMode) {
+            // COMBO_MODE：combo 播到 max_step 后回绕同片段——swapTo 内部走
+            // rebaseToReference（重锚定回片段第 0 帧，消除累积漂移，回绕瞬间
+            // 允许 1 帧内姿态微跳），跳过拳法距离门禁与冷却。
+            const want = f.trackingClips.combo ? 'combo' : 'guard';
+            swapTo(want);
+            if (want === 'combo') f.desiredClip = 'combo';  // 常驻循环：队列不被消费
+          } else {
           if (f.clip !== 'guard' && f.desiredClip === f.clip) f.desiredClip = 'guard';
           let want = f.desiredClip && f.trackingClips[f.desiredClip] ? f.desiredClip : 'guard';
           if (want !== 'guard') {
-            const r = PUNCH_RANGE[want];
-            if (!(dist >= r[0] && dist <= r[1])) want = 'guard';  // 距离不合适：本轮不出拳
+            const r = this.punchRangeFor(f, want);
+            // 距离不合适或处于稳定期/冷却：本轮不出拳（§4.2/§4.4）
+            if (!(dist >= r[0] && dist <= r[1]) || this.time < f.noPunchUntil) want = 'guard';
             // （允许同时出拳：互相前倾才够得着对方的头——见 PUNCH_RANGE 标定）
           }
-          if (want !== f.clip || want !== 'guard') {
-            const nf = new TrackingFighter(this.mujoco, this.model, this.data, side,
-              f.trackingClips[want], side === 'B' ? { yawOffset: Math.PI } : {});
-            nf.reset(0);
-            nf.lastAction.set(prev.lastAction);
-            nf.pdTarget.set(prev.pdTarget);
-            f.tracking = nf;
-            f.clip = want;
-            f.clipSwaps++;
-            f.desiredClip = 'guard';  // 队列已消费（无论打没打）
-          } else {
-            f.tracking.reset(0);
-            f.tracking.lastAction.set(prev.lastAction);
-            f.tracking.pdTarget.set(prev.pdTarget);
+          if (want === 'guard' && f.clip === 'guard') carryOver();
+          else swapTo(want);
+          }
+        } else if (f.clip === 'guard' && f.desiredClip && f.desiredClip !== 'guard' &&
+                   f.trackingClips[f.desiredClip] && f.punchIntent &&
+                   PUNCH_EARLY_EXIT[f.desiredClip]) {
+          // §4.4 缩短守卫等待：出拳意图挂起且距离合适时，参考姿态一回到共享
+          // 守卫站架（书端静态帧/弹跳过零点，误差 ≤0.035 rad）就提前切入，
+          // 不必等整个守卫循环播完（守卫片段 ~9s，旧逻辑最坏 9s 延迟）。
+          // 出拳片段自带的守卫书端 + 过渡段就是"准备"阶段，衔接天然连续。
+          const r = this.punchRangeFor(f, f.desiredClip);
+          if (dist >= r[0] && dist <= r[1] && this.time >= f.noPunchUntil &&
+              nearGuardPose(f.tracking.net, f.tracking.timeStep, f.trackingClips[f.desiredClip])) {
+            swapTo(f.desiredClip);
           }
         }
         f.tracking.physicsStep(4);
@@ -566,34 +1058,40 @@ export class BoxingController {
       const b = side === 'A' ? this.ids.pelvisA : this.ids.pelvisB;
       const px = d.xpos[3 * b], py = d.xpos[3 * b + 1], pz = d.xpos[3 * b + 2];
       let fx = 0, fy = 0, fz = 0, tx = 0, ty = 0, tz = 0;
-      if (this.assist && !f.amo && !f.down) {
+      if (this.assist && !f.amo && !f.down &&
+          ((f.tracking && this.comboMode) || this.trackingAssist || !f.tracking)) {
         if (!f._ppos) f._ppos = [px, py, pz];
         const vxx = (px - f._ppos[0]) / dt, vyy = (py - f._ppos[1]) / dt, vzz = (pz - f._ppos[2]) / dt;
         f._ppos = [px, py, pz];
         if (f.tracking) {
-          // tracking mode: no XY anchor (the clip owns planar motion), only a
-          // soft vertical seat toward the reference pelvis height. The punch
-          // clips' deep stance (0.487m) is the policies' least stable window —
-          // this keeps a wobbling crouch from becoming a self-KO. ~30N typical,
-          // capped well below body weight: tracking dynamics stay dominant.
-          const refZ = f.tracking.net.refAt(f.tracking.timeStep).body_pos_w[2];
-          fz = clamp(120 * (refZ - pz) - 25 * vzz, 0, 110);
-          // 躯干扶正：深蹲段的侧向倾倒（垂直托力救不了）——小力矩扶正骨盆，
-          // 幅度远小于脚本模式的吊架
-          const R = d.xmat, o = 9 * b;
-          const w = this.freeDof[side] + 3;
-          const wx = d.qvel[w], wy = d.qvel[w + 1], wz = d.qvel[w + 2];
-          tx = clamp(150 * R[o + 5] - 10 * wx, -70, 70);
-          ty = clamp(-150 * R[o + 2] - 10 * wy, -70, 70);
-          tz = clamp(-8 * wz, -15, 15);
-          // 水平阻尼：互刺时上身碰撞的冲量是缠倒主因，阻尼抵消部分推挤
-          if (f.clip !== 'guard') {
-            fx += clamp(-90 * vxx, -55, 55);
-            fy += clamp(-90 * vyy, -55, 55);
+          if (!this.comboMode) {
+            // tracking mode: no XY anchor (the clip owns planar motion), only a
+            // soft vertical seat toward the reference pelvis height. The punch
+            // clips' deep stance (0.487m) is the policies' least stable window —
+            // this keeps a wobbling crouch from becoming a self-KO. ~30N typical,
+            // capped well below body weight: tracking dynamics stay dominant.
+            const refZ = f.tracking.net.refAt(f.tracking.timeStep).body_pos_w[2];
+            fz = clamp(120 * (refZ - pz) - 25 * vzz, 0, 110);
+            // 躯干扶正：深蹲段的侧向倾倒（垂直托力救不了）——小力矩扶正骨盆，
+            // 幅度远小于脚本模式的吊架
+            const R = d.xmat, o = 9 * b;
+            const w = this.freeDof[side] + 3;
+            const wx = d.qvel[w], wy = d.qvel[w + 1], wz = d.qvel[w + 2];
+            tx = clamp(150 * R[o + 5] - 10 * wx, -70, 70);
+            ty = clamp(-150 * R[o + 2] - 10 * wy, -70, 70);
+            tz = clamp(-8 * wz, -15, 15);
+            // 水平阻尼：互刺时上身碰撞的冲量是缠倒主因，阻尼抵消部分推挤
+            if (f.clip !== 'guard') {
+              fx += clamp(-90 * vxx, -55, 55);
+              fy += clamp(-90 * vyy, -55, 55);
+            }
           }
           // 缠斗分离：punch 片段只拉近距离（cross 前冲 0.8m），守卫片段原地——
           // 没有东西能拉开距离，贴身后必然缠倒。距离 <0.55m 时给双方一个
           // 温和的分离力，等效裁判分开缠斗，让下一轮出拳在有效距离发起。
+          // plan-revamp v2c（2026-09-29 队长预授权）：COMBO_MODE 下对 tracking
+          // 机器人仅启用此分离项（双机对练 1m 间距互殴是双机闸门唯一死因，
+          // 单机全段已 PASS），其余辅助仍关断。
           const op = this.pelvisPos(f.opponent.side);
           const dx = px - op[0], dy = py - op[1];
           const dd = Math.hypot(dx, dy) || 1e-6;
@@ -617,20 +1115,29 @@ export class BoxingController {
         tz = clamp(-8 * wz, -15, 15);
       }
       }
+      const xfo = 6 * b;
+      if (!Number.isFinite(fx + fy + fz + tx + ty + tz)) continue;
+      // §4.6 辅助用量计量：对 |F|、|τ| 做时间积分（N·s / N·m·s）。放在有限性
+      // 检查之后（NaN 不得污染计量），击退力在此之后才叠加，不计入——那是
+      // 展示效果，不是平衡辅助。
+      {
+        const u = this.assistUsage[side];
+        u.fx += Math.abs(fx) * dt; u.fy += Math.abs(fy) * dt; u.fz += Math.abs(fz) * dt;
+        u.tx += Math.abs(tx) * dt; u.ty += Math.abs(ty) * dt; u.tz += Math.abs(tz) * dt;
+      }
       const kb = this.knockback[side];
       if (kb) {
         if (this.time > kb.until) this.knockback[side] = null;
         else { fx += kb.f[0]; fy += kb.f[1]; }
       }
-      const xfo = 6 * b;
-      if (!Number.isFinite(fx + fy + fz + tx + ty + tz)) continue;
       d.xfrc_applied[xfo] = fx; d.xfrc_applied[xfo + 1] = fy; d.xfrc_applied[xfo + 2] = fz;
       d.xfrc_applied[xfo + 3] = tx; d.xfrc_applied[xfo + 4] = ty; d.xfrc_applied[xfo + 5] = tz;
     }
 
-      if (this.fighters.A.tracking || this.fighters.B.tracking) {
+      if ((this.fighters.A.tracking || this.fighters.B.tracking) && !this.comboMode) {
         // 僵局检测：接触漂移把双机推远后没有任何片段能拉近距离——
-        // 距离 >1.9m 持续 3s 就重开回合（回到标准 1.0m 站位）
+        // 距离 >1.9m 持续 3s 就重开回合（回到标准 1.0m 站位）。
+        // COMBO_MODE 下禁用（D8：无回合重置，N1 连续观察）。
         const far = Math.hypot(d.xpos[3 * this.ids.pelvisA] - d.xpos[3 * this.ids.pelvisB],
           d.xpos[3 * this.ids.pelvisA + 1] - d.xpos[3 * this.ids.pelvisB + 1]);
         if (far > 1.9) {
@@ -651,7 +1158,8 @@ export class BoxingController {
     this.checkFall();
     for (const side of ['A', 'B']) {
       this.damage[side] = Math.max(0, this.damage[side] - 0.15 * dt);
-      if (this.damage[side] >= 7) {
+      // COMBO_MODE（D8）：禁用伤害 KO 注入——组合循环连续观察不重置回合
+      if (!this.comboMode && this.damage[side] >= 7) {
         const f = this.fighters[side];
         f.down = true;
         const winner = side === 'A' ? 'B' : 'A';
@@ -706,22 +1214,56 @@ export class BoxingController {
 
   registerHit(attacker, victim, vulGeom) {
     if (this.hitCooldown[attacker] > this.time) return;
+    const f = this.fighters[attacker];
+    const av = this.fighters[victim];
+    // §4.5 命中判定：出拳手段处于发力阶段 + 拳速达标才算有效命中；否则记为
+    // 轻触（graze，不计分/不伤害/不击退）——区分轻触、贴身挤压与有效出拳。
+    const attacking = f.tracking ? this.punchActive(f)
+      : (f.state === 'strike' || f.state === 'windup');
+    const speed = Math.max(f.fistSpeed.left, f.fistSpeed.right);
+    if (!attacking || speed < HIT_MIN_FIST_SPEED) {
+      this.hitCooldown[attacker] = this.time + 0.15;  // 抑制 graze 连发刷屏
+      this.events.push({ type: 'graze', attacker, victim, t: this.time });
+      return;
+    }
+    // 以出拳事件为单位去重：同一次出拳（片段执行/组合步）只计一分，
+    // 贴身持续接触无法靠冷却窗口反复得分。
+    // （fight 模式例外：无出拳事件语义——punchEventId 在常驻 fight 片段里
+    // 不递增，按事件去重会一场只记一分；控频交给上一行的 0.45s hitCooldown。）
+    if (!this.fightMode && f.lastScoredPunch === f.punchEventId) return;
     this.hitCooldown[attacker] = this.time + 0.45;
+    f.lastScoredPunch = f.punchEventId;
     const points = this.headGeoms[victim].has(vulGeom) ? 2 : 1;
     const kind = points === 2 ? 'head' : 'body';
-    const f = this.fighters[attacker];
     f.scores.hits += 1;
     f.scores.points += points;
     this._pendingHits++;
     this.events.push({ type: 'hit', attacker, victim, points, kind, t: this.time });
-    const av = this.fighters[victim];
-    this.knockback[victim] = { f: [-av.forward * 40, 0, 0], until: this.time + 0.06 };
-    av.staggerFor = 0.35 + Math.random() * 0.2 + (kind === 'head' ? 0.2 : 0);
+    // §4.5 击退：方向取实际接触方向（拳→受击者骨盆的水平向量），限制幅度
+    // 与时长；物理碰撞已产生冲量，展示击退不再额外放大。
+    // FIGHT（终审修复）：击退是训练分布外的外注入（xfrc 30N×60ms；终审已证
+    // 非双倒主因，但训练自博弈中不存在该力）——fight 模式下不注入，命中
+    // 效果只走 stagger/伤害/记分，与训练侧命中语义（奖励+接触力）对齐。
+    if (!this.fightMode) {
+      const d = this.data;
+      const fid = this.fistSiteId(attacker, speed >= f.fistSpeed.right ? 'left' : 'right');
+      const vb = victim === 'A' ? this.ids.pelvisA : this.ids.pelvisB;
+      let kdx = d.xpos[3 * vb] - d.site_xpos[3 * fid];
+      let kdy = d.xpos[3 * vb + 1] - d.site_xpos[3 * fid + 1];
+      const kn = Math.hypot(kdx, kdy) || 1e-6;
+      this.knockback[victim] = { f: [(kdx / kn) * 30, (kdy / kn) * 30, 0], until: this.time + 0.06 };
+    }
+    av.staggerFor = 0.35 + f.rng() * 0.2 + (kind === 'head' ? 0.2 : 0);
     this.damage[victim] += kind === 'head' ? 1.5 : 1.0;
   }
 
   checkFall() {
     if (this.koState) return;
+    // COMBO_MODE（D8）：禁用摔倒 KO——摔倒判读交给回归断言（minZ≥0.40），
+    // 组合循环内不触发 KO/回合系统。
+    // FIGHT_MODE 走本函数正常路径（KO 启用）：tracking 阈 0.40 与训练侧
+    // sparring_mdp.FALL_HEIGHT_THRESHOLD 同口径（数据契约 §5.1）。
+    if (this.comboMode) return;
     for (const side of ['A', 'B']) {
       const b = side === 'A' ? this.ids.pelvisA : this.ids.pelvisB;
       // tracking mode: the punch clips' boxing stance dips to pelvis 0.487m —
@@ -740,29 +1282,64 @@ export class BoxingController {
   resetRound() {
     this.mujoco.mj_resetDataKeyframe(this.model, this.data, 0);
     this.mujoco.mj_forward(this.model, this.data);
+    // FIGHT 反镜像：回合序号推进并刷新 B 机相位（30→55→15→40→…），A 恒 0。
+    // 非 fight 模式仅计数不生效。
+    this._roundNo++;
+    this._assignFightPhase();
     for (const side of ['A', 'B']) {
       const f = this.fighters[side];
       f.down = false; f.state = 'idle'; f.stateT = 0;
-      f.idleFor = 0.6 + Math.random() * 0.5;
+      f.idleFor = 0.6 + this.rng() * 0.5;
+      f.faceYaw = side === 'A' ? 0 : Math.PI;  // 回合重置：回到出生朝向
       f.staggerFor = 0; f.combo = null;
+      f.punchIntent = null; f.punchEventId = 0; f.lastScoredPunch = -1;
+      f.noPunchUntil = this.time + PUNCH_SETTLE_T;  // 回合稳定期
+      f.fistSpeed = { left: 0, right: 0 };
+      f._fistPrev = { left: null, right: null, t: null };
       f.anchor = [...f.anchor0];
       f._ppos = null;
       f._goal = null;
       f._obsPrev = { dist: null, t: null, fistL: null, fistR: null };
       if (f.amo) f.amo.reset();
       if (f.tracking) {
-        // new round: back to the guard clip at frame 0
-        f.tracking = new TrackingFighter(this.mujoco, this.model, this.data, side, f.trackingClips.guard,
-          side === 'B' ? { yawOffset: Math.PI } : {});
+        // new round: back to the guard clip at frame 0（重锚定角统一公式替换
+        // 硬编码 π；keyframe 重置 + mj_forward 已在前，xquat 就绪）。
+        // FIGHT_MODE：回 fight 常驻片段，delta = 出生朝向 − ref0 yaw（KO/
+        // 超时回合重置后与 setTracking 启动同状态）。
+        // COMBO_MODE：手动回合重置也回 combo 常驻片段。
+        // COMBO 模式锁 delta=0（同 setTracking/swapTo，实测非零 delta 致倒）。
+        const clip = this.fightMode && f.trackingClips.fight ? 'fight'
+          : this.comboMode && f.trackingClips.combo ? 'combo' : 'guard';
+        // FIGHT 反镜像：参考起始帧 = 本回合相位偏移（_assignFightPhase 已刷新），
+        // delta 基准帧与之对齐，重锚定瞬间 anchor-ori 观测归零（训练 RSI 起点）。
+        const phase = clip === 'fight' ? this._fightPhase[side] : 0;
+        const delta = clip === 'fight' ? this.rebaseYawDelta(side, f.trackingClips[clip], phase)
+          : this.comboMode && clip === 'combo' ? 0
+          : this.rebaseYawDelta(side, f.trackingClips[clip]);
+        f.tracking = new TrackingFighter(this.mujoco, this.model, this.data, side, f.trackingClips[clip],
+          { yawOffset: delta,
+            // fight 下修正公式双侧启用（同 setTracking：非零 delta 需与
+            // policyTick 观测旋转互逆）
+            faceoff: this.fightMode || (this.faceoffMode && side === 'B'),
+            opponent: f.opponent?.tracking ?? null,
+            ctrlRange: clip === 'fight' ? FIGHT_CTRL_RANGE : null });
         f.tracking.reset(0);
-        f.clip = 'guard';
-        f.desiredClip = 'guard';
+        if (clip === 'combo' || clip === 'fight') {
+          // 同 setTracking：combo/fight 起始帧非关键帧书端，重置后原位重锚定
+          // 到参考起始帧；fight 再叠加 B 机出生位抖动（次级反镜像扰动）
+          f.tracking.rebaseToReference(delta, phase);
+          this._applyFightSpawnJitter(side);
+          this.mujoco.mj_forward(this.model, this.data);
+        }
+        f.clip = clip;
+        f.desiredClip = clip;
       }
     }
     this.knockback = { A: null, B: null };
     this.koState = null;
     this.damage = { A: 0, B: 0 };
     this._lastSimTime = -1;
+    this._roundT = 0;   // fight 60s 回合计时归零（Q6）
     this.events.push({ type: 'round', t: this.time });
   }
 

@@ -95,6 +95,11 @@ models/tracking_g1/  mjlab G1 29-DoF 基模型（阶段4）
 当前为 v0 预览（guard 策略四槽位，训练收敛后用
 `tools/deploy_tracking_clips.sh` 替换）。详见 `docs/stage4-tracking-notes.md`。
 
+> **图例（2026-09-29）**：默认模式当前为 **guard-only**（守卫循环），完整拳法
+> 组合循环见 `?scene=tracking&combo=1`（双机 12.5s 组合拳常驻循环）。
+> 追加 `&faceoff=1` 开启面对面对抗子选项（B 机 180° 转身面向 A 机）。
+> 调试类脚本（`_probe_*`/`_diag_*`）已归档至 `tools/_archive/`。
+
 ### 场景模型的坑（务必知道）
 
 - AMO 策略训练于 **AMO 仓库的官方 g1.xml**（23 扭矩电机、腕部融合）。

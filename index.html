@@ -134,7 +134,7 @@
 
   <div id="panel" class="clickable">
     <div class="row"><label>仿真速度</label>
-      <span><button data-speed="0.5">0.5×</button><button data-speed="1" class="on">1×</button><button data-speed="2">2×</button></span>
+      <span><button data-speed="0.25">0.25×</button><button data-speed="0.5">0.5×</button><button data-speed="1" class="on">1×</button><button data-speed="2">2×</button></span>
     </div>
     <div class="row"><label>攻击性</label><input type="range" id="aggr" min="0.5" max="2" step="0.1" value="1"></div>
     <div class="row"><label>RL 策略</label>
@@ -150,7 +150,11 @@
     </div>
     <div class="row">
       <button id="orbitBtn" class="on">镜头环绕 开</button>
+      <button id="evalCamBtn" title="固定评估机位（方案 §5：人工验收同一视角）">评估视角</button>
+    </div>
+    <div class="row">
       <button id="tacticsBtn" disabled title="自博弈训练的战术策略（vendor/tactics/tactics.json）">战术 AI 关</button>
+      <button id="trailBtn" title="显示双机拳套最近 1.5s 轨迹（核对出拳指向）">拳套轨迹 关</button>
     </div>
     <div class="row">
       <button id="sceneBtn" title="阶段4：29自由度追踪机器人 + 拳击片段策略（需 vendor/policy/boxing_*.bin）">追踪模式 关</button>
@@ -173,6 +177,6 @@
   }
 }
 </script>
-<script type="module" src="./src/main.js?v=2"></script>
+<script type="module" src="./src/main.js?v=5"></script>
 </body>
 </html>

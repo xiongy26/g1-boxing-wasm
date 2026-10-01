@@ -41,9 +41,10 @@ const mujoco = await loadMujoco({
   locateFile: f => new URL(`../vendor/mujoco/${f}`, import.meta.url).href,
 });
 
-// stage-4 clip policies (boxing_{guard,jab,cross,hook}); present only after the
-// GPU training pipeline has been run — 404-tolerant like tactics.json
-const TRACKING_CLIPS = ['guard', 'jab', 'cross', 'hook'];
+// stage-4 clip policies (boxing_{guard,jab,cross,hook,combo}); present only
+// after the GPU training pipeline has been run — per-clip tolerant (a missing
+// slot is skipped; combo ships later than the 4 base clips).
+const TRACKING_CLIPS = ['guard', 'jab', 'cross', 'hook', 'combo'];
 let trackingNetsPromise = null;
 function loadTrackingNets() {
   if (!trackingNetsPromise) {
@@ -56,11 +57,42 @@ function loadTrackingNets() {
         if (!r.ok) throw new Error(`boxing_${name}_meta.json HTTP ` + r.status);
         return r.json();
       }),
-    ]).then(([buf, meta]) => [name, new TrackingNetwork(buf, meta)])))
-      .then(entries => Object.fromEntries(entries))
+    ]).then(([buf, meta]) => [name, new TrackingNetwork(buf, meta)])
+      .catch(err => {
+        // 逐 clip 容错（plan-revamp-20260928 §5.2 D3）：单槽位 404/解析失败
+        // 只跳过该槽位，combo 未部署不破坏既有 4 槽位加载；全部失败才回退 AMO。
+        console.warn(`tracking clip ${name} unavailable — slot skipped:`, err.message);
+        return [name, null];
+      })))
+      .then(entries => {
+        const nets = Object.fromEntries(entries.filter(([, net]) => net));
+        if (!Object.keys(nets).length) throw new Error('no tracking clip policies deployed');
+        return nets;
+      })
       .catch(err => { trackingNetsPromise = null; throw err; });
   }
   return trackingNetsPromise;
+}
+
+// fight 单策略（FIGHT_MODE 专用，W4）：boxing_fight.bin（168 维观测）或
+// &policy= 白名单指定的探针位权重。与 loadTrackingNets 同一容错形状——失败
+// 时 promise 复位，调用方决定回退路径。
+let fightNetPromise = null;
+function loadFightNet() {
+  if (!fightNetPromise) {
+    fightNetPromise = Promise.all([
+      fetch(`./vendor/policy/${FIGHT_BIN}.bin`).then(r => {
+        if (!r.ok) throw new Error(`${FIGHT_BIN}.bin HTTP ` + r.status);
+        return r.arrayBuffer();
+      }),
+      fetch(`./vendor/policy/${FIGHT_BIN}_meta.json`).then(r => {
+        if (!r.ok) throw new Error(`${FIGHT_BIN}_meta.json HTTP ` + r.status);
+        return r.json();
+      }),
+    ]).then(([buf, meta]) => new TrackingNetwork(buf, meta))
+      .catch(err => { fightNetPromise = null; throw err; });
+  }
+  return fightNetPromise;
 }
 
 setProgress(15, '正在下载场景与机器人网格…');
@@ -68,6 +100,34 @@ setProgress(15, '正在下载场景与机器人网格…');
 // stage-4 29-DoF tracking scene — but only if the trained clip policies are
 // actually deployed; otherwise fall back to AMO with a note.
 const TRACKING_REQUESTED = new URLSearchParams(location.search).get('scene') === 'tracking';
+// COMBO_MODE（plan-revamp-20260928 §5.2 D4）：?combo=1 时两拳手常驻循环
+// combo 片段（35s 连续组合拳），禁 KO 与回合重置；默认 false 不影响既有路径。
+// FIGHT_MODE（plan-fight-20260929 §5.2 W4）：?scene=tracking&fight=1 真实对打
+// ——两台 G1 共享 168 维观测（含 opponent_state 14 维）的 fight 策略自主对打，
+// KO/回合重置/记分全启用。独立开关（只在 tracking 场景生效）且优先于 combo
+// （URL 契约 §5.1：同给时 fight 优先，故 COMBO_MODE 追加 && !FIGHT_REQUESTED）；
+// 未带 fight=1 的 URL 两个布尔与旧版完全一致。
+const FIGHT_REQUESTED = new URLSearchParams(location.search).get('scene') === 'tracking' &&
+  new URLSearchParams(location.search).get('fight') === '1';
+// &policy=<basename>.bin（fight 调试参数）：探针位权重加载，限 vendor/policy/
+// 目录下的 .bin。白名单 = 字符集 [A-Za-z0-9._-] 且不含 ".."、以 .bin 结尾
+// （防路径穿越，meta 路径由同一 basename 派生）；文件不存在时 fetch 404 回退
+// 默认 fight 权重。不带该参数时行为与现在完全一致。
+const FIGHT_BIN_DEFAULT = 'boxing_fight';
+const FIGHT_BIN = (() => {
+  const p = new URLSearchParams(location.search).get('policy');
+  if (!p) return FIGHT_BIN_DEFAULT;
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]*\.bin$/.test(p) || p.includes('..')) {
+    console.warn('policy param rejected (vendor/policy whitelist):', p);
+    return FIGHT_BIN_DEFAULT;
+  }
+  return p.slice(0, -'.bin'.length);
+})();
+const COMBO_MODE = new URLSearchParams(location.search).get('combo') === '1' && !FIGHT_REQUESTED;
+// FACEOFF（Phase 2，2026-09-29）：?combo=1&faceoff=1 的子选项——B 侧重锚定
+// 回出生朝向 π（180° 面向 A，真对抗站位）。默认关闭：已交付 delta=0 演示
+// 路径字节不变。头less 验证见 tools/_probe_faceoff.mjs。
+const FACEOFF_MODE = COMBO_MODE && new URLSearchParams(location.search).get('faceoff') === '1';
 let trackingAvailable = false;
 if (TRACKING_REQUESTED) {
   trackingAvailable = await fetch('./vendor/policy/boxing_guard_meta.json')
@@ -77,8 +137,71 @@ if (TRACKING_REQUESTED) {
   }
 }
 const TRACKING = TRACKING_REQUESTED && trackingAvailable;
+// fight 权重部署探测（与上方 guard meta 探测同构）：meta 缺失 = fight 尚未
+// 部署 → FIGHT_MODE 不生效，场景 XML 不打 ±0.6 补丁，页面走既有 tracking
+// 行为（控制台留痕）；meta 在而 bin 损坏属异常部署，启动加载路径兜底回退。
+let fightAvailable = false;
+if (FIGHT_REQUESTED) {
+  fightAvailable = await fetch(`./vendor/policy/${FIGHT_BIN}_meta.json`)
+    .then(r => r.ok).catch(() => false);
+  if (!fightAvailable) {
+    setProgress(16, `对打策略（${FIGHT_BIN}）尚未就绪，回退追踪模式…`);
+    console.warn(`fight policy meta missing: vendor/policy/${FIGHT_BIN}_meta.json — fight=1 ignored`);
+  }
+}
+// FIGHT_MODE 生效条件：fight=1 请求 + 追踪场景可用 + fight 权重已部署
+// （fight 权重是 29-DoF tracking 场景策略，AMO 场景无法挂载）。
+const FIGHT_MODE = FIGHT_REQUESTED && TRACKING && fightAvailable;
 const SCENE_FILE = TRACKING ? './models/scene_boxing_tracking.xml' : './models/scene_boxing_amo.xml';
-const xml = await fetch(SCENE_FILE).then(r => r.text());
+const xml0 = await fetch(SCENE_FILE).then(r => r.text());
+// COMBO 模式出生隔离（plan-revamp 终局裁决 2026-09-29）：双机互看同一段
+// 全接触拳击参考，±0.5m 出生间距下首拳必达对手引发连环倒（单机闸门已证
+// 策略全段稳定）。加载时把 keyframe 出生位 ±0.5 → ±1.2（间距 2.4m，超出
+// 拳距），tracking 场景文件字节不动；默认 AMO 场景不受影响。
+// FIGHT 模式出生对峙（W4）：±0.5 → ±0.6（间距 1.2m，与训练侧
+// SPARRING_SPAWN_DIST=1.2 一致，A yaw 0 / B yaw π 面对面），同构替换、
+// 场景文件字节不动；fight 优先于 combo（FIGHT_MODE 蕴含 !COMBO_MODE）。
+// FIGHT 物理对齐补丁（终审 P1：接触场景确定性同步双倒——浏览器物理与训练
+// 场景的接触解析差异，仅 fight 分支打入，全部为字符串运行时替换）：
+//  1) 求解器对齐：iterations 100 → 10 + ls_iterations=20（训练侧
+//     tracking_env_cfg.py SimulationCfg.MujocoCfg 同值；欠收敛求解=接触更软，
+//     策略权重就是在该分布下训练/评估的）。
+//  2) 身体碰撞 hull condim 3 → 1：训练侧 FULL_COLLISION（g1_constants.py）
+//     除脚外全部 condim=1（无摩擦纯法向接触）；condim=3 的切向摩擦/扭转
+//     让双机贴身肢体接触互相"咬合"拖拽，是同步双倒主因（候选 #1）。
+//     注意 A_foot_capsule 类嵌套于 A_collision 类内部，故第 3) 条必须
+//     同步显式回写 condim=3，否则脚底失去摩擦立即摔倒。
+//  3) 脚类 geom 显式 condim=3 + friction 0.6 + priority=1（训练侧脚碰撞
+//     参数：friction=(0.6,), priority=1，抵消 2) 的类继承）。
+//  4) 拳头 geom 去 priority=1/friction=0.8 改 condim=1（训练侧
+//     hand_collision：默认 priority、condim=1、friction 默认）。
+// 训练侧无关节 damping 之外的额外注入；mjlab 默认 impratio=1/cone=pyramidal
+// 与浏览器默认一致，无需补。XML 文件字节不动；默认/combo 路径零触碰。
+const xml = FIGHT_MODE
+  ? xml0
+      .split('-0.50 0 0.761').join('-0.60 0 0.761')
+      .split(' 0.50 0 0.761').join(' 0.60 0 0.761')
+      .split('solver="Newton" iterations="100"')
+        .join('solver="Newton" iterations="10" ls_iterations="20"')
+      .split('<geom group="3" rgba=".2 .6 .2 .3" type="capsule" contype="1" conaffinity="1" />')
+        .join('<geom group="3" rgba=".2 .6 .2 .3" type="capsule" contype="1" conaffinity="1" condim="1" />')
+      .split('<geom type="capsule" size="0.01" />')
+        .join('<geom type="capsule" size="0.01" condim="3" friction="0.6 0.005 0.0001" priority="1" />')
+      .split('contype="1" conaffinity="1" friction="0.8 0.005 0.0001" priority="1"')
+        .join('contype="1" conaffinity="1" condim="1"')
+  : COMBO_MODE
+    ? xml0.split('-0.50 0 0.761').join('-1.20 0 0.761').split(' 0.50 0 0.761').join(' 1.20 0 0.761')
+    : xml0;
+if (FIGHT_MODE && xml === xml0) console.warn('fight spawn replacement did not apply');
+// 物理对齐补丁生效性校验：四个锚串任一失配（上游 XML 改版）都只丢对应项，
+// 逐项报警避免静默带病运行。
+if (FIGHT_MODE) {
+  if (!xml.includes('ls_iterations="20"')) console.warn('fight patch: solver alignment did not apply');
+  if (!xml.includes('<geom group="3" rgba=".2 .6 .2 .3" type="capsule" contype="1" conaffinity="1" condim="1" />')) console.warn('fight patch: body collision condim did not apply');
+  if (!xml.includes('size="0.01" condim="3"')) console.warn('fight patch: foot condim/friction did not apply');
+  if (xml.includes('friction="0.8 0.005 0.0001" priority="1"')) console.warn('fight patch: fist geom alignment did not apply');
+}
+if (COMBO_MODE && xml === xml0) console.warn('combo spawn isolation did not apply');
 // mesh file names come straight from the scene's asset list
 const stlNames = [...new Set([...xml.matchAll(/file="([^"]+\.STL)"/g)].map(m => m[1]))];
 
@@ -101,6 +224,9 @@ const OBJ = mujoco.mjtObj;
 const id = (t, n) => mujoco.mj_name2id(model, t.value ?? t, n);
 const ctl = new BoxingController(model, data, {
   mujoco,
+  comboMode: COMBO_MODE,
+  faceoff: FACEOFF_MODE,
+  fightMode: FIGHT_MODE,
   ids: {
     pelvisA: id(OBJ.mjOBJ_BODY, 'A_pelvis'), pelvisB: id(OBJ.mjOBJ_BODY, 'B_pelvis'),
     headA: id(OBJ.mjOBJ_SITE, 'A_head'), headB: id(OBJ.mjOBJ_SITE, 'B_head'),
@@ -113,15 +239,49 @@ const DT = model.opt.timestep;
 // RL on by default: attach policies to both robots before the first frame so
 // they box from the moment the loading overlay disappears. AMO scene → the
 // AMO whole-body policy; tracking scene → the clip-policy library.
+// fightActive（P1-1，审查修复）：运行时 fight 生效标志——loadFightNet 成功挂载
+// 后才置位。编译期 const FIGHT_MODE 只反映"meta 探测通过"；bin 损坏回退后
+// UI/toggle 一律改读本标志，不再读 FIGHT_MODE。
+let fightActive = false;
 if (TRACKING) {
-  setProgress(94, '正在加载拳击片段策略…');
-  try {
-    const nets = await loadTrackingNets();
-    ctl.setTracking('A', nets);
-    ctl.setTracking('B', nets);
-    console.log('tracking clip policies loaded:', Object.keys(nets).join(', '));
-  } catch (err) {
-    console.error('tracking policies failed to load at boot — scripted fallback', err);
+  if (FIGHT_MODE) {
+    // fight 模式：单策略挂双侧（168 维 obs，双机对称自系构造见
+    // tracking_policy.mjs policyTick 的 opponent_state 段）。
+    // bin 缺失/解析失败的回退（P1-1）：关掉 ctl.fightMode 与 fightActive，
+    // 挂既有片段栈——行为逻辑回到默认 tracking（KO/回合系统本就启用）。
+    // 残留差异（catch 内无法撤销）：场景 model 已按 ±0.6 出生位编译（XML
+    // 补丁在权重加载前打入），回合重置的 keyframe 仍是 1.2m 对峙位；需要
+    // 精确默认行为的场景应去掉 fight=1 刷新页面。
+    setProgress(94, '正在加载对打策略…');
+    try {
+      const fightNet = await loadFightNet();
+      ctl.setTracking('A', { fight: fightNet });
+      ctl.setTracking('B', { fight: fightNet });
+      fightActive = true;
+      console.log(`fight policy loaded: ${FIGHT_BIN} obs_dim=${fightNet.meta.obs_dim}` +
+        ` opponent_state@${JSON.stringify(fightNet.meta.obs_layout?.opponent_state ?? null)}`);
+    } catch (err) {
+      console.error(`fight policy (${FIGHT_BIN}) failed to load — falling back to clip stack`, err);
+      ctl.fightMode = false;
+      fightActive = false;
+      try {
+        const nets = await loadTrackingNets();
+        ctl.setTracking('A', nets);
+        ctl.setTracking('B', nets);
+      } catch (err2) {
+        console.error('tracking policies failed to load at boot — scripted fallback', err2);
+      }
+    }
+  } else {
+    setProgress(94, '正在加载拳击片段策略…');
+    try {
+      const nets = await loadTrackingNets();
+      ctl.setTracking('A', nets);
+      ctl.setTracking('B', nets);
+      console.log('tracking clip policies loaded:', Object.keys(nets).join(', '));
+    } catch (err) {
+      console.error('tracking policies failed to load at boot — scripted fallback', err);
+    }
   }
 } else {
   setProgress(94, '正在加载 AMO 策略权重…');
@@ -439,7 +599,58 @@ function setOrbit(on) {
   b.textContent = on ? '镜头环绕 开' : '镜头环绕 关';
   b.classList.toggle('on', on);
 }
+// 固定评估视角（方案 §5：人工验收使用同一视角）——所有录像/对比用这个机位
+$('evalCamBtn').onclick = () => {
+  camera.position.set(3.1, -2.4, 1.7);
+  controls.target.set(0, 0, 0.95);
+  setOrbit(false);
+};
 $('aggr').oninput = e => { ctl.aggression = Number(e.target.value); };
+
+// ------------------------------------------------------------------ 拳套轨迹
+// §5 持续记录辅助指标的可视化：双机四只拳套的最近轨迹，用于人工核对出拳
+// 目标指向与收拳路径。轨迹点按帧采样，长度约 1.5s（90 帧 @60fps）。
+const TRAIL_N = 90;
+const fistTrailSites = [
+  { id: ctl.ids.fistLA, color: 0xff8a8a },
+  { id: ctl.ids.fistRA, color: 0xff4d4d },
+  { id: ctl.ids.fistLB, color: 0x8ab0ff },
+  { id: ctl.ids.fistRB, color: 0x4d7dff },
+].map(({ id, color }) => {
+  const pos = new Float32Array(3 * TRAIL_N);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setDrawRange(0, 0);
+  const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.65 }));
+  line.visible = false;
+  line.frustumCulled = false;
+  scene.add(line);
+  return { id, pos, geo, line, n: 0 };
+});
+let trailsOn = false;
+$('trailBtn').onclick = e => {
+  trailsOn = !trailsOn;
+  e.target.textContent = trailsOn ? '拳套轨迹 开' : '拳套轨迹 关';
+  e.target.classList.toggle('on', trailsOn);
+  for (const t of fistTrailSites) { t.n = 0; t.geo.setDrawRange(0, 0); t.line.visible = trailsOn; }
+};
+function updateFistTrails() {
+  if (!trailsOn) return;
+  for (const t of fistTrailSites) {
+    const i = 3 * t.id;
+    if (t.n < TRAIL_N) {
+      t.pos.set([data.site_xpos[i], data.site_xpos[i + 1], data.site_xpos[i + 2]], 3 * t.n);
+      t.n++;
+    } else {
+      t.pos.copyWithin(0, 3);   // shift left by one point
+      t.pos[3 * (TRAIL_N - 1)] = data.site_xpos[i];
+      t.pos[3 * (TRAIL_N - 1) + 1] = data.site_xpos[i + 1];
+      t.pos[3 * (TRAIL_N - 1) + 2] = data.site_xpos[i + 2];
+    }
+    t.geo.setDrawRange(0, t.n);
+    t.geo.attributes.position.needsUpdate = true;
+  }
+}
 
 // ------------------------------------------------------------------ tactics policy
 // Learned self-play tactics (optional file vendor/tactics/tactics.json): when
@@ -499,7 +710,9 @@ async function toggleAMO(side) {
         ctl.clearTracking(side);
       } else {
         banner('<span class="small">正在加载拳击片段策略…</span>', 8000);
-        const nets = await loadTrackingNets();
+        // fight 生效（运行时 fightActive，非编译期 FIGHT_MODE）时重开挂单策略
+        // fight 槽；回退后走片段栈——与启动加载同一运行时语义（P1-1）
+        const nets = fightActive ? { fight: await loadFightNet() } : await loadTrackingNets();
         ctl.setTracking(side, nets);
         rlState[side] = true;
       }
@@ -586,6 +799,7 @@ function frame(now) {
 
     syncRenderer();
     controls.update();
+    updateFistTrails();
     handleEvents();
     renderer.render(scene, camera);
 
@@ -596,9 +810,16 @@ function frame(now) {
       const clipInfo = TRACKING
         ? ` · A[${ctl.fighters.A.clip}@${ctl.fighters.A.tracking ? ctl.fighters.A.tracking.timeStep : '-'}] B[${ctl.fighters.B.clip}@${ctl.fighters.B.tracking ? ctl.fighters.B.tracking.timeStep : '-'}]<br>`
         : '<br>';
+      // §4.6 辅助用量与 §4.5 命中分类计数：验收报告直接引用这里的数字。
+      // 追踪模式辅助默认关断（trackingAssist，策略无外力训练）——用量为 0。
+      const au = ctl.assistUsage;
+      const auSum = u => (u.fx + u.fy + u.fz + u.tx + u.ty + u.tz);
+      const assistNote = TRACKING ? (ctl.trackingAssist ? '追踪辅助开' : '追踪辅助关断') : (ctl.assist ? '开' : '关');
       ui.stats.innerHTML =
         `FPS ${fps} · 物理 ${physMs.toFixed(1)}ms/帧 · sim t=${data.time.toFixed(1)}s${clipInfo}` +
-        `接触 ${data.ncon} · 最低骨盆 ${minZ.toFixed(2)}m · A伤害 ${ctl.damage.A.toFixed(1)} / B伤害 ${ctl.damage.B.toFixed(1)}`;
+        `接触 ${data.ncon} · 最低骨盆 ${minZ.toFixed(2)}m · A伤害 ${ctl.damage.A.toFixed(1)} / B伤害 ${ctl.damage.B.toFixed(1)}<br>` +
+        `辅助用量 |F|+|τ|: A ${auSum(au.A).toFixed(0)} B ${auSum(au.B).toFixed(0)} ` +
+        `(${assistNote}) · 命中 ${ctl.fighters.A.scores.hits}/${ctl.fighters.B.scores.hits}`;
       // keep the per-side buttons in sync with the running clip
       if (TRACKING) {
         for (const side of ['A', 'B']) {
@@ -619,11 +840,13 @@ function frame(now) {
   }
 }
 
-// 图例首行标明当前模式（追踪/AMO），便于确认加载的是哪套控制
+// 图例首行标明当前模式（对打/追踪/AMO），便于确认加载的是哪套控制
 {
   const ml = document.getElementById('modeLine');
   if (ml) ml.textContent = TRACKING
-    ? '追踪模式 · 29 DoF 片段策略（guard/jab/cross/hook）'
+    ? (fightActive
+      ? `对打模式 · 168 维观测共享策略（${FIGHT_BIN}，opponent_state 14 维）· KO/60s 回合/记分启用`
+      : `追踪模式 · 29 DoF 片段策略（guard/jab/cross/hook${COMBO_MODE ? ' + combo 组合循环' : ''}${FACEOFF_MODE ? ' · faceoff 面对面对抗' : ''}）`)
     : 'AMO 模式 · 23 DoF 全身策略';
 }
 

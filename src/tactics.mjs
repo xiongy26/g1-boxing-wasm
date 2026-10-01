@@ -172,13 +172,21 @@ export class TacticsPolicy {
       for (let k = 0; k < probs.length; k++) if (probs[k] > 1e-12) H -= probs[k] * Math.log(probs[k]);
       lossSum += -adv * logpa - entropy * H;
       entSum += H;
-      // dLogits = adv*(onehot-p) - beta*p*(log p + H)
+      // dLogits = dL/dlogits for DESCENT on L = -adv·logp(a) - entropy·H:
+      //   dL/dlogit_k = adv·(p_k - 1[k=a]) + entropy·p_k·(log p_k + H)
+      // （2026-09-26 修复：原先写的是 J = -L 的上升方向，交给 params -= lr·g
+      //   的 Adam 等于反着训——tools/test_tactics_grad.mjs 数值梯度检查抓出。）
       const dLogits = new Float32Array(probs.length);
       for (let k = 0; k < probs.length; k++) {
-        let g = adv * ((k === a ? 1 : 0) - probs[k]);
-        if (probs[k] > 1e-12) g -= entropy * probs[k] * (Math.log(probs[k]) + H);
+        let g = adv * (probs[k] - (k === a ? 1 : 0));
+        if (probs[k] > 1e-12) g += entropy * probs[k] * (Math.log(probs[k]) + H);
         dLogits[k] = g;
       }
+      // 链式法则：forward 的最终 logits = netGain·net + priorW·prior，反向
+      // 传播要对 net logits 求 dL，必须乘 netGain（否则 netGain<1 时梯度被
+      // 放大 1/netGain——tools/test_tactics_grad.mjs 抓出的第二个 bug）。
+      const gain = this.netGain;
+      if (gain !== 1) for (let k = 0; k < dLogits.length; k++) dLogits[k] *= gain;
       this._backprop(layers, dLogits, grad);
     }
     const n = traj.length;

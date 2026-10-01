@@ -24,10 +24,9 @@ const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2).filter(a => !a.startsWith('--'));
 const raw = process.argv.slice(2);
 const flags = raw.filter(a => a.startsWith('--'));
-const DURATION = Number(argv[0]) > 0 ? Number(argv[0]) : (COMBO ? 42 : 16);
+const DURATION = Number(argv[0] || (COMBO ? 42 : 16));
 const KO_AT = DURATION * 0.6;
-// PREFIX 规则：argv[0] 为数字时长时前缀取 argv[1]，否则 argv[0] 即前缀
-const PREFIX = Number(argv[0]) > 0 ? (argv[1] || 'spinkick') : (argv[0] || 'spinkick');
+const PREFIX = argv[1] || 'spinkick';
 const ASSIST = flags.includes('--assist');
 const seedIdx = raw.indexOf('--seed');
 const SEED = seedIdx >= 0 ? Number(raw[seedIdx + 1] ?? 1) : (Math.random() * 2 ** 31) | 0;
@@ -39,11 +38,7 @@ for (const f of fs.readdirSync(path.join(root, 'models/unitree_g1/assets'))) {
     vfs.addBuffer('unitree_g1/assets/' + f, new Uint8Array(fs.readFileSync(path.join(root, 'models/unitree_g1/assets', f))));
   }
 }
-let xml = fs.readFileSync(path.join(root, "models/scene_boxing_tracking.xml"), "utf8");
-// COMBO 模式出生隔离（与 main.js 的加载时替换同一规则）：±0.5 → ±1.2
-if (COMBO) {
-  xml = xml.split('-0.50 0 0.761').join('-1.20 0 0.761').split(' 0.50 0 0.761').join(' 1.20 0 0.761');
-}
+const xml = fs.readFileSync(path.join(root, 'models/scene_boxing_tracking.xml'), 'utf8');
 const model = mujoco.MjModel.from_xml_string(xml, vfs);
 const data = new mujoco.MjData(model);
 mujoco.mj_resetDataKeyframe(model, data, 0);
@@ -108,7 +103,8 @@ try {
 }
 
 ctl.setTracking('A', nets);
-ctl.setTracking('B', nets);
+// PROBE: B completely untracked — its actuators stay at ctrl=0
+console.log('PROBE: B untracked');
 console.log('tracking mode on: A + B');
 
 const DT = model.opt.timestep;
@@ -142,6 +138,7 @@ for (let i = 0; i < steps; i++) {
     koT = t;
     console.log(`t=${t.toFixed(1)}: injected lethal damage on A`);
   }
+  if (t < 4 && (i % 100) === 0) console.log(`FINE t=${t.toFixed(2)} zA=${za.toFixed(3)} clipA=${ctl.fighters.A.clip}@${ctl.fighters.A.tracking.timeStep} swA=${ctl.fighters.A.clipSwaps}`);
   if (t - lastPrint >= 2) {
     lastPrint = t;
     console.log(`t=${t.toFixed(1)} zA=${za.toFixed(2)} zB=${zb.toFixed(2)} ` +

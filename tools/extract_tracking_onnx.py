@@ -20,7 +20,17 @@ otherwise with an exact numpy replica of the graph.
 
 Usage:
   uv run --no-project --with onnx --with onnxruntime python \
-      tools/extract_tracking_onnx.py <onnx_file> <out_prefix>
+      tools/extract_tracking_onnx.py <onnx_file> <out_prefix> \
+      [--clip-meta manifest.json] [--clip-name boxing_jab]
+
+--clip-meta/--clip-name: 把动作清单条目（阶段秒标、有效出拳区间、来源，见
+tools/cut_boxing_clips.py v3）写进 meta 的 motion.clip 字段，浏览器调度器
+（src/boxing_ai.mjs punchRangeFor/punchActive）按元数据调度；缺失时回退
+内建标定值。
+
+--clip-meta-direct <file>：整份 JSON 即单条 clip 元数据（不经清单按键索引）。
+combo 槽位（plan-revamp-20260928 §5.2）用——35s 单动作不属于 clips_v3 清单，
+来源/窗口等元数据直接落一个 JSON 文件注入。
 """
 import json
 import sys
@@ -106,7 +116,39 @@ def numpy_forward(obs, arrays):
 
 
 def main():
-    onnx_file, out_prefix = sys.argv[1], sys.argv[2]
+    args = sys.argv[1:]
+    onnx_file, out_prefix = args[0], args[1]
+    clip_meta = None
+    if "--clip-meta-direct" in args:
+        # combo 槽位直通注入：整份 JSON 就是 motion.clip 条目
+        direct_path = args[args.index("--clip-meta-direct") + 1]
+        with open(direct_path) as f:
+            clip_meta = json.load(f)
+    elif "--clip-meta" in args:
+        manifest_path = args[args.index("--clip-meta") + 1]
+        clip_name = args[args.index("--clip-name") + 1] if "--clip-name" in args else \
+            __import__("os").path.basename(out_prefix)
+        with open(manifest_path) as f:
+            entry = json.load(f).get(clip_name)
+        if entry:
+            clip_meta = {
+                "manifest_version": entry.get("version"),
+                "source": entry.get("source"),
+                "window_s": entry.get("window_s"),
+                "hand": entry.get("hand"),
+                "support_foot": entry.get("support_foot"),
+                "stance": entry.get("stance"),
+                "phases_s": entry.get("phases_s"),
+                "strike_window_s": (entry.get("measured") or {}).get("strike_window_s")
+                    or entry.get("phases_s", {}).get("strike_s"),
+                "punch_range_m": (entry.get("measured") or {}).get("punch_range_m")
+                    or entry.get("punch_range_m"),
+                "forward_drive_m": (entry.get("measured") or {}).get("forward_drive_m"),
+                "policy_run": entry.get("policy_run"),
+            }
+        else:
+            print(f"warning: {clip_name} not in {manifest_path}; no clip metadata embedded")
+
     m = onnx.load(onnx_file)
     meta = {p.key: p.value for p in m.metadata_props}
 
@@ -137,12 +179,13 @@ def main():
     obs_names = parse_strings(meta["observation_names"])
     # obs layout per observation_names: command(2*nq) anchor_ori(6) [anchor_pos(3)]
     # [lin_vel(3)] ang_vel(3) joint_pos(nq) joint_vel(nq) actions(nq)
+    # + opponent_state(14) (P2 双机对打, obs_dim 168, 契约 plan-fight §5.1)
     layout, cursor = {}, 0
     for name in obs_names:
         size = {"command": 2 * num_joints, "motion_anchor_ori_b": 6,
                 "motion_anchor_pos_b": 3, "base_lin_vel": 3, "base_ang_vel": 3,
                 "joint_pos": num_joints, "joint_vel": num_joints,
-                "actions": num_joints}[name]
+                "actions": num_joints, "opponent_state": 14}[name]
         layout[name] = [cursor, size]
         cursor += size
     assert cursor == obs_dim, (cursor, obs_dim)
@@ -162,9 +205,9 @@ def main():
         "body_names": parse_strings(meta["body_names"]),
         "obs_names": obs_names,
         "obs_layout": layout,
-        "motion": {"fps": 50, "length": motion_len, "max_step": int(clip_max)},
-        "offsets": offsets,
-        "shapes": {
+        "motion": {"fps": 50, "length": motion_len, "max_step": int(clip_max),
+                   **({"clip": clip_meta} if clip_meta else {})},
+        "offsets": offsets,        "shapes": {
             "mean": [obs_dim], "std": [obs_dim],
             **{f"W:{i}": list(w.shape) for i, w in enumerate(weights)},
             **{f"b:{i}": [b.size] for i, b in enumerate(biases)},

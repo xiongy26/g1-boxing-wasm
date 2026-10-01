@@ -1,0 +1,315 @@
+{
+ "format": "tracking_v1",
+ "source": ".workbuddy/gpu/eval_out/v3/export_5000/model_5000.onnx",
+ "obs_dim": 154,
+ "num_joints": 29,
+ "num_bodies": 14,
+ "joint_names": [
+  "left_hip_pitch_joint",
+  "left_hip_roll_joint",
+  "left_hip_yaw_joint",
+  "left_knee_joint",
+  "left_ankle_pitch_joint",
+  "left_ankle_roll_joint",
+  "right_hip_pitch_joint",
+  "right_hip_roll_joint",
+  "right_hip_yaw_joint",
+  "right_knee_joint",
+  "right_ankle_pitch_joint",
+  "right_ankle_roll_joint",
+  "waist_yaw_joint",
+  "waist_roll_joint",
+  "waist_pitch_joint",
+  "left_shoulder_pitch_joint",
+  "left_shoulder_roll_joint",
+  "left_shoulder_yaw_joint",
+  "left_elbow_joint",
+  "left_wrist_roll_joint",
+  "left_wrist_pitch_joint",
+  "left_wrist_yaw_joint",
+  "right_shoulder_pitch_joint",
+  "right_shoulder_roll_joint",
+  "right_shoulder_yaw_joint",
+  "right_elbow_joint",
+  "right_wrist_roll_joint",
+  "right_wrist_pitch_joint",
+  "right_wrist_yaw_joint"
+ ],
+ "default_joint_pos": [
+  -0.312,
+  0.0,
+  0.0,
+  0.669,
+  -0.363,
+  0.0,
+  -0.312,
+  0.0,
+  0.0,
+  0.669,
+  -0.363,
+  0.0,
+  0.0,
+  0.0,
+  0.0,
+  0.2,
+  0.2,
+  0.0,
+  0.6,
+  0.0,
+  0.0,
+  0.0,
+  0.2,
+  -0.2,
+  0.0,
+  0.6,
+  0.0,
+  0.0,
+  0.0
+ ],
+ "kp": [
+  40.179,
+  99.098,
+  40.179,
+  99.098,
+  28.501,
+  28.501,
+  40.179,
+  99.098,
+  40.179,
+  99.098,
+  28.501,
+  28.501,
+  40.179,
+  28.501,
+  28.501,
+  14.251,
+  14.251,
+  14.251,
+  14.251,
+  14.251,
+  16.778,
+  16.778,
+  14.251,
+  14.251,
+  14.251,
+  14.251,
+  14.251,
+  16.778,
+  16.778
+ ],
+ "kd": [
+  2.558,
+  6.309,
+  2.558,
+  6.309,
+  1.814,
+  1.814,
+  2.558,
+  6.309,
+  2.558,
+  6.309,
+  1.814,
+  1.814,
+  2.558,
+  1.814,
+  1.814,
+  0.907,
+  0.907,
+  0.907,
+  0.907,
+  0.907,
+  1.068,
+  1.068,
+  0.907,
+  0.907,
+  0.907,
+  0.907,
+  0.907,
+  1.068,
+  1.068
+ ],
+ "action_scale": [
+  0.548,
+  0.351,
+  0.548,
+  0.351,
+  0.439,
+  0.439,
+  0.548,
+  0.351,
+  0.548,
+  0.351,
+  0.439,
+  0.439,
+  0.548,
+  0.439,
+  0.439,
+  0.439,
+  0.439,
+  0.439,
+  0.439,
+  0.439,
+  0.075,
+  0.075,
+  0.439,
+  0.439,
+  0.439,
+  0.439,
+  0.439,
+  0.075,
+  0.075
+ ],
+ "anchor_body_name": "torso_link",
+ "body_names": [
+  "pelvis",
+  "left_hip_roll_link",
+  "left_knee_link",
+  "left_ankle_roll_link",
+  "right_hip_roll_link",
+  "right_knee_link",
+  "right_ankle_roll_link",
+  "torso_link",
+  "left_shoulder_roll_link",
+  "left_elbow_link",
+  "left_wrist_yaw_link",
+  "right_shoulder_roll_link",
+  "right_elbow_link",
+  "right_wrist_yaw_link"
+ ],
+ "obs_names": [
+  "command",
+  "motion_anchor_ori_b",
+  "base_ang_vel",
+  "joint_pos",
+  "joint_vel",
+  "actions"
+ ],
+ "obs_layout": {
+  "command": [
+   0,
+   58
+  ],
+  "motion_anchor_ori_b": [
+   58,
+   6
+  ],
+  "base_ang_vel": [
+   64,
+   3
+  ],
+  "joint_pos": [
+   67,
+   29
+  ],
+  "joint_vel": [
+   96,
+   29
+  ],
+  "actions": [
+   125,
+   29
+  ]
+ },
+ "motion": {
+  "fps": 50,
+  "length": 624,
+  "max_step": 623,
+  "clip": {
+   "source": "xsens_boxing_v2: 12.5s real-human Xsens boxing mocap window retargeted to G1 29DoF (g1-dance GMR pipeline); embedded motion table is 624 frames / 12.48s @50Hz",
+   "motion_npz": ".workbuddy/gpu/g1dance_pipeline/motions/npz/xsens_boxing_v2.npz",
+   "window_s": {
+    "start": 0.0,
+    "end": 12.48
+   },
+   "hand": "both",
+   "punches": {
+    "straight_events": 1,
+    "arc_events": 10,
+    "note": "PROVENANCE ONLY: numeric classification recorded on the old 35s full segment (xsens_boxing_test.npz); straight right 27.5-28.1s straightness 0.949, arcs 21.4-22.0s / 26.8-27.3s sweep 0.10-0.17m. Windows do not apply to the 12.48s v2 clip, kept for traceability"
+   },
+   "loop": "combo mode plays 0..max_step then wraps to 0 with in-place rebase (src/boxing_ai.mjs COMBO_MODE)"
+  }
+ },
+ "offsets": {
+  "mean": 0,
+  "std": 616,
+  "W:0": 1232,
+  "W:1": 316624,
+  "W:2": 840912,
+  "W:3": 971984,
+  "b:0": 986832,
+  "b:1": 988880,
+  "b:2": 989904,
+  "b:3": 990416,
+  "motion:joint_pos": 990532,
+  "motion:joint_vel": 1062916,
+  "motion:body_pos_w": 1135300,
+  "motion:body_quat_w": 1240132,
+  "motion:body_lin_vel_w": 1379908,
+  "motion:body_ang_vel_w": 1484740
+ },
+ "shapes": {
+  "mean": [
+   154
+  ],
+  "std": [
+   154
+  ],
+  "W:0": [
+   512,
+   154
+  ],
+  "W:1": [
+   256,
+   512
+  ],
+  "W:2": [
+   128,
+   256
+  ],
+  "W:3": [
+   29,
+   128
+  ],
+  "b:0": [
+   512
+  ],
+  "b:1": [
+   256
+  ],
+  "b:2": [
+   128
+  ],
+  "b:3": [
+   29
+  ],
+  "motion:joint_pos": [
+   624,
+   29
+  ],
+  "motion:joint_vel": [
+   624,
+   29
+  ],
+  "motion:body_pos_w": [
+   624,
+   14,
+   3
+  ],
+  "motion:body_quat_w": [
+   624,
+   14,
+   4
+  ],
+  "motion:body_lin_vel_w": [
+   624,
+   14,
+   3
+  ],
+  "motion:body_ang_vel_w": [
+   624,
+   14,
+   3
+  ]
+ }
+}

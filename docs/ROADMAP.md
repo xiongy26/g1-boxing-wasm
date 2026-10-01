@@ -1,8 +1,9 @@
 # G1 拳击项目总计划（ROADMAP）
 
-> 最后更新：2026-09-23。本文档是项目的**唯一进度总览**，各专项细节见文末链接的子文档。
+> 最后更新：2026-09-26。本文档是项目的**唯一进度总览**，各专项细节见文末链接的子文档。
 > 项目目标：在浏览器（MuJoCo WASM + 纯 JS 推理，无服务器）里让两台 Unitree G1
 > 进行物理真实的自主拳击对战——出拳有真实发力链、战术有攻防博弈。
+> 真实感优化的分阶段方案与验收门槛见 `docs/plan-realistic-boxing.md`。
 
 ---
 
@@ -45,6 +46,9 @@
 2. **战术自博弈**：小样本 REINFORCE 必然塌缩到互避 standoff（七轮实验实证）；
    唯一可行解 = 距离带先验硬性拥有"是否交战"决策 + `netGain=0.1` 限幅网络残差。
    部署权重 `priorW=1.0 / netGain=0.1` 烤进 JSON，浏览器行为 = 评估行为。
+   **2026-09-26 更正**：塌缩的根因之一是 update() 梯度符号反转 + netGain
+   链式因子缺失（数值梯度检查 `tools/test_tactics_grad.mjs` 抓出，已修复）；
+   现有 tactics.json 是带病权重，建议重训后再下"先验必需"的结论。
 3. **训练环境**：脚本回退模式在 AMO 场景站不住（吊架 < 整机重力），
    任何训练都必须挂 AMO 权重；无头 node 管线（6 worker，~1.4×实时/worker）
    是现成的 sim2sim 回归器。
@@ -95,9 +99,11 @@
 
 - `node tools/test_amo.mjs 22` — 无头回归：双机对战 + KO 注入 + 回合恢复（每次改动必跑）
 - `node tools/eval_tactics.mjs 16 14` — 战术层 vs 旧版量化对比
+- `node tools/test_tactics_grad.mjs` — 战术层解析梯度 vs 数值微分（更新实现必跑）
 - `node tools/test_tracking.mjs vendor/policy/<name>` — 追踪策略 JS 前向 vs ONNX 逐向量对齐（阶段 4）
 - `node tools/test_tracking_sim.mjs <name>` — 追踪策略单机 sim2sim（WASM 场景整段跟踪不倒，阶段 4）
-- `node tools/test_tracking_boxing.mjs 22 boxing` — 追踪模式双机无头回归（调度/KO/回合，阶段 4）
+- `node tools/test_tracking_boxing.mjs 22 boxing [--assist] [--seed N]` — 追踪模式双机无头回归（辅助开关分别报告）
+- `node tools/check_clip.mjs <clips目录> --enrich` — 片段 FK 检查 + manifest 回填（重定向后必跑）
 - `.workbuddy/gpu/e2e_tracking.cjs` — 浏览器 E2E（追踪模式；`.workbuddy/tmp/e2e_default_rl.cjs` 为 AMO 模式）
 - python↔JS 逐 tick 对齐 — 任何新策略移植的验收标准（~1e-6 误差）
 

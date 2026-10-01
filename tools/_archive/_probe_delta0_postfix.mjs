@@ -107,6 +107,7 @@ try {
   console.log('tactics policy not found — random fallback drives clip choices');
 }
 
+ctl.rebaseYawDelta = () => 0;  // PROBE: delta=0 (post freeQpos fix)
 ctl.setTracking('A', nets);
 ctl.setTracking('B', nets);
 console.log('tracking mode on: A + B');

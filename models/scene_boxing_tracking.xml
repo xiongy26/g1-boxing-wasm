@@ -1,4 +1,4 @@
-<mujoco model="g1_boxing_tracking"><compiler angle="radian" meshdir="unitree_g1/assets" autolimits="true" /><option timestep="0.005" integrator="Euler" solver="Newton" iterations="100" gravity="0 0 -9.81" /><default><joint type="hinge" /><geom condim="3" /></default><asset><material name="floor_mat" rgba="0.32 0.33 0.38 1" /><mesh name="A_pelvis" file="pelvis.STL" />
+<mujoco model="g1_boxing_tracking"><compiler angle="radian" meshdir="unitree_g1/assets" autolimits="true" /><option timestep="0.005" integrator="implicitfast" solver="Newton" iterations="100" gravity="0 0 -9.81" /><default><joint type="hinge" /><geom condim="3" /></default><asset><material name="floor_mat" rgba="0.32 0.33 0.38 1" /><mesh name="A_pelvis" file="pelvis.STL" />
     <mesh name="A_pelvis_contour_link" file="pelvis_contour_link.STL" />
     <mesh name="A_left_hip_pitch_link" file="left_hip_pitch_link.STL" />
     <mesh name="A_left_hip_roll_link" file="left_hip_roll_link.STL" />

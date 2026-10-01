@@ -123,6 +123,13 @@ const TRACKING_TORQUE_LIM = {
   wrist_roll: 25, wrist_pitch: 5, wrist_yaw: 5,
 };
 
+// 统一的 yaw 提取（wxyz 四元数，ZYX 欧拉），结果归一化到 (−π,π]。调度器的重
+// 锚定角必须走本函数：裸 2*atan2(z,w) 对后半圈朝向给出 (π,2π] 的值（如
+// +198.2°），再与非归一化角相减会差出整 360°。
+export function yawOfQuat(w, x, y, z) {
+  return Math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z));
+}
+
 const rotMatFromQuat = (qw, qx, qy, qz, m) => {
   // row-major 3x3, wxyz quaternion
   const xx = qx * qx, yy = qy * qy, zz = qz * qz;
@@ -132,12 +139,22 @@ const rotMatFromQuat = (qw, qx, qy, qz, m) => {
 };
 
 export class TrackingFighter {
-  constructor(mujoco, model, data, side, net, { yawOffset = 0 } = {}) {
+  // opponent（W2，plan-fight-20260929）：对手 TrackingFighter 引用，仅 fight
+  // ONNX（meta.obs_layout.opponent_state 存在）的对手段观测需要；可空——缺席
+  // 时按 side 翻转的命名约定自解析（见 _resolveOpponentRefs）。
+  // ctrlRange（P-A，终审第 3 轮）：逐关节 PD 目标位置夹紧窗（Float32Array
+  // [lo,hi]×n，meta.joint_names 顺序），复刻训练侧 position actuator 的
+  // ctrlrange 夹紧——训练 ctrl 目标被 mjlab 软窗夹住，浏览器 JS PD 原本无
+  // 此约束；仅 fight 模式传入（见 boxing_ai.mjs FIGHT_CTRL_RANGE），默认
+  // null = 不夹紧，guard/combo 路径字节不变。
+  constructor(mujoco, model, data, side, net, { yawOffset = 0, faceoff = false, opponent = null, ctrlRange = null } = {}) {
     this.mujoco = mujoco;
     this.model = model;
     this.data = data;
     this.side = side;
     this.net = net;
+    this.opponent = opponent;
+    this.ctrlRange = ctrlRange;
     this.beta = meta_beta(net.meta);          // deployment EMA (RoboJuDo default 1.0)
     // side B faces the opposite way from the clip's baked-in yaw. The policy
     // is yaw-invariant (all obs are body-frame), so rotating the REFERENCE
@@ -145,6 +162,13 @@ export class TrackingFighter {
     // spinning 180° to chase the original heading.
     this.yawOffset = yawOffset;
     this._qz = yawOffset ? [Math.cos(yawOffset / 2), 0, 0, Math.sin(yawOffset / 2)] : null;
+    // faceoff（Phase 2，2026-09-29）：true 时 _qz/rebaseToReference 使用正确的
+    // Rz(δ) 前乘公式（ry = zw*qy + zz*qx）。历史代码两处同用 ry = zw*qy −
+    // zz*qx——不是合法四元数合成（非同态），δ=0 时 zw=1/zz=0 两式恒等（已
+    // 交付 delta=0 路径字节不变），δ≠0 且 ref0 带侧倾时状态侧与观测侧不相
+    // 消，anchor_ori 观测泄漏实测 0.645（_probe_faceoff obsdiff）。默认
+    // false 保持既有行为字节不变。
+    this._faceoffFix = faceoff;
 
     const jid = n => mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT.value, side + '_' + n);
     const aid = n => mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR.value, side + '_' + n);
@@ -179,6 +203,17 @@ export class TrackingFighter {
     const tb = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY.value, side + '_torso_link');
     if (tb < 0) throw new Error('torso body not found: ' + side);
     this.torsoBody = tb;
+    this.pelvisBody = pbody;   // 对手段观测/对手侧引用用（fight 模式）
+    // FIGHT 对手段引用（plan-fight-20260929 §5.2 W2）：仅当 ONNX meta 带
+    // opponent_state 段（obs_dim 168）时解析；旧 154 维 ONNX 整块跳过，既有
+    // 路径字节不变。一致性锚点（两侧审计点）：训练侧 anchor = MotionCommand
+    // cfg 的 anchor_body_name = "torso_link"（config/g1/env_cfgs.py:42，
+    // robot_anchor_pos_w/quat_w 即 torso_link 的 body pos/quat）↔ 浏览器侧
+    // self 锚点 = side_torso_link（this.torsoBody，与 anchor_ori 观测同一
+    // body）；对方 root = opp pelvis、双拳 = opp 左/右 wrist_yaw_link，与
+    // sparring_mdp.opponent_state() 的 body 选择一一对应。
+    this._oppRefs = null;
+    if (net.meta.obs_layout?.opponent_state) this._resolveOpponentRefs(true);
 
     this.lastAction = new Float32Array(n);
     this.pdTarget = Float32Array.from(net.defaultQ);
@@ -189,6 +224,32 @@ export class TrackingFighter {
     this.healthy = true;
   }
 
+  // 对手 body 引用解析（惰性缓存一次）：优先用注入对手 fighter 的 side 与
+  // pelvis id，缺席（单机向量测试/构造顺序）时按 side 翻转的命名约定自解析
+  // ——双机共享同一 model/data，body id 与 side 一一对应，两种来源等价；对手
+  // fighter 事后被替换（swapTo 每次新建）也不失配。严格模式（构造期）缺
+  // body/自由关节直接抛错，避免 fight 模式带病上线。
+  _resolveOpponentRefs(strict = false) {
+    if (this._oppRefs) return this._oppRefs;
+    const opp = this.opponent && this.opponent.side !== this.side ? this.opponent : null;
+    const oppSide = opp ? opp.side : (this.side === 'A' ? 'B' : 'A');
+    const bid = n => this.mujoco.mj_name2id(this.model, this.mujoco.mjtObj.mjOBJ_BODY.value, oppSide + '_' + n);
+    const pelvis = opp && opp.pelvisBody >= 0 ? opp.pelvisBody : bid('pelvis');
+    const fistL = bid('left_wrist_yaw_link'), fistR = bid('right_wrist_yaw_link');
+    const pj = pelvis >= 0 ? this.model.body_jntadr[pelvis] : -1;
+    const freeDof = pj >= 0 && this.model.jnt_type[pj] === this.mujoco.mjtJoint.mjJNT_FREE.value
+      ? this.model.jnt_dofadr[pj] : -1;
+    if (pelvis < 0 || fistL < 0 || fistR < 0 || freeDof < 0) {
+      if (strict) {
+        throw new Error('opponent_state bodies unresolved for side ' + oppSide +
+          ` (pelvis=${pelvis} fistL=${fistL} fistR=${fistR} freeDof=${freeDof})`);
+      }
+      return null;
+    }
+    this._oppRefs = { pelvis, fistL, fistR, freeDof };
+    return this._oppRefs;
+  }
+
   reset(fromStep = 0) {
     this.lastAction.fill(0);
     this.pdTarget.set(this.net.defaultQ);
@@ -196,6 +257,52 @@ export class TrackingFighter {
     this.stepCount = 0;
     this.clipDone = false;
     this.healthy = true;
+  }
+
+  // 原位重锚定 RSI：把机器人状态设为训练回合起点——29 关节 qpos/qvel 取参考
+  // 帧位姿（startStep，默认 0 = 既有回合起点帧；fight 模式传非零相位偏移，
+  // 即训练 RSI 随机起始帧的确定性等价物）；基座世界 x/y 保留（战斗站位
+  // 不动）、z 取参考值、四元数 = Rz(yawDelta) ⊗ 参考帧基座四元数（wxyz
+  // Hamilton 世界系前乘，与 policyTick 的 _qz 观测旋转同约定）。基座 6 维
+  // 速度清零；lastAction 清零、pdTarget 回 defaultQ、时钟从 startStep 起
+  // （reset(fromStep) 原生支持）。切换片段时以 yawDelta = 当前 torso yaw −
+  // 参考起始帧 torso yaw 调用，anchor-ori 观测在重锚定瞬间归零。不调用
+  // mj_forward：双机器人共用 model/data，由调用方统一刷一次。
+  // startStep 默认 0：既有调用（guard/combo 全部路径）不传该参数，行为字节不变。
+  rebaseToReference(yawDelta = 0, startStep = 0) {
+    const d = this.data, ref = this.net.refAt(startStep);
+    for (let i = 0; i < this.n; i++) {
+      d.qpos[this.qposadr[i]] = ref.joint_pos[i];
+      d.qvel[this.dofadr[i]] = ref.joint_vel[i];
+    }
+    // (qw,qx,qy,qz) ⊗ (zw,0,0,zz)：Hamilton 后乘，与 policyTick 的 _qz 观测
+    // 旋转同式同 Δ——状态侧与观测侧代数相消，勿单侧修改（ref0 基座严格
+    // 竖直、纯 yaw 时前后乘精确等价，但不要依赖这一点改乘序）。
+    // 2026-09-29 修复：基座 qpos 写入必须用 freeQpos（jnt_qposadr，含 3 位置
+    // +4 四元数布局），此前误用 freeDof（jnt_dofadr）——A 侧两者同为 0 未暴
+    // 露，B 侧 qposadr=7/dofadr=6 时整段状态错位写穿（y 被高度覆盖、四元数
+    // 串位），rebase 后必倒。
+    const zw = Math.cos(yawDelta / 2), zz = Math.sin(yawDelta / 2);
+    const qw = ref.body_quat_w[0], qx = ref.body_quat_w[1];
+    const qy = ref.body_quat_w[2], qz = ref.body_quat_w[3];
+    if (this._faceoffFix) {
+      // 正确的 Rz(δ) ⊗ q（wxyz Hamilton 前乘=世界系旋转），与下方 policyTick
+      // 修正式完全同式。遗留后乘是体轴旋转，参考基座相对四元数带俯仰时不与
+      // Rz 交换（组合片段 q_rel 俯仰 +0.247），状态/观测两侧不相消。
+      d.qpos[this.freeQpos + 3] = zw * qw - zz * qz;
+      d.qpos[this.freeQpos + 4] = zw * qx - zz * qy;
+      d.qpos[this.freeQpos + 5] = zw * qy + zz * qx;
+      d.qpos[this.freeQpos + 6] = zw * qz + zz * qw;
+    } else {
+      // 遗留公式（δ=0 时与修正式恒等；保持既有路径字节不变）
+      d.qpos[this.freeQpos + 3] = zw * qw - zz * qz;
+      d.qpos[this.freeQpos + 4] = zw * qx + zz * qy;
+      d.qpos[this.freeQpos + 5] = zw * qy - zz * qx;
+      d.qpos[this.freeQpos + 6] = zw * qz + zz * qw;
+    }
+    d.qpos[this.freeQpos + 2] = ref.body_pos_w[2];
+    for (let k = 0; k < 6; k++) d.qvel[this.freeDof + k] = 0;
+    this.reset(startStep);   // lastAction/pdTarget 归零、时钟 = 参考起始帧
   }
 
   // call every physics step (200 Hz); policy every DECIMATION steps
@@ -239,8 +346,8 @@ export class TrackingFighter {
       // rotate the reference quat by yawOffset about world z (wxyz Hamilton)
       const [zw, zx, zy, zz] = this._qz;
       const rw = zw * qw - zz * qz;
-      const rx = zw * qx + zz * qy;
-      const ry = zw * qy - zz * qx;
+      const rx = this._faceoffFix ? zw * qx - zz * qy : zw * qx + zz * qy;
+      const ry = this._faceoffFix ? zw * qy + zz * qx : zw * qy - zz * qx;
       const rz = zw * qz + zz * qw;
       qw = rw; qx = rx; qy = ry; qz = rz;
     }
@@ -265,6 +372,53 @@ export class TrackingFighter {
     for (let i = 0; i < n; i++) obs[o++] = d.qpos[this.qposadr[i]] - net.defaultQ[i];
     for (let i = 0; i < n; i++) obs[o++] = d.qvel[this.dofadr[i]];
 
+    // ---- opponent_state（W2，fight ONNX 专属；旧 ONNX 无此段整块跳过，obs
+    // 游标路径字节不变）。14 维对手段，全部在观察者自身 torso（anchor）系，
+    // 与训练侧 sparring_mdp.opponent_state() 逐维对齐（.workbuddy/gpu/
+    // g1dance_pipeline/third_party/unitree_rl_mjlab/src/tasks/tracking/mdp/
+    // sparring_mdp.py）：
+    //   [0:3]  R_anchor^T·(p_opp_pelvis − p_self_anchor)   opp_root_pos_rel
+    //   [3:6]  R_anchor^T·v_opp_pelvis（世界系线速度）      opp_root_lin_vel_rel
+    //   [6:9]  R_anchor^T·(p_opp_Lwrist − p_self_anchor)   opp_fist_L_rel
+    //   [9:12] R_anchor^T·(p_opp_Rwrist − p_self_anchor)   opp_fist_R_rel
+    //   [12]   sin(yaw_opp − yaw_self)   [13] cos(...)
+    // yaw 口径照抄训练侧：yaw_self 取自锚点（torso_link）四元数、yaw_opp 取自
+    // 对方 pelvis（root_link）四元数（euler_xyz 的 z 角，同 yawOfQuat 公式）。
+    // 对方线速度 = 对方自由关节 qvel 前 3 维（MuJoCo 约定：全局系、body 原点
+    // 速度）↔ 训练侧 root_link_lin_vel_w。
+    const oppLayout = net.meta.obs_layout?.opponent_state;
+    if (oppLayout) {
+      const refs = this._resolveOpponentRefs();
+      if (!refs) throw new Error('opponent_state refs unresolved in policyTick (side ' + this.side + ')');
+      const base = oppLayout[0];   // 数据契约 §5.1：偏移 154、宽 14
+      const xa = 3 * this.torsoBody;
+      const apx = d.xpos[xa], apy = d.xpos[xa + 1], apz = d.xpos[xa + 2];
+      const qo = 4 * this.torsoBody;
+      const Ra = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+      rotMatFromQuat(tq[qo], tq[qo + 1], tq[qo + 2], tq[qo + 3], Ra);
+      // rel = R_anchor^T · Δp（row-major 转置乘）
+      const put3 = (i, wx, wy, wz) => {
+        const dx = wx - apx, dy = wy - apy, dz = wz - apz;
+        obs[base + i]     = Ra[0] * dx + Ra[3] * dy + Ra[6] * dz;
+        obs[base + i + 1] = Ra[1] * dx + Ra[4] * dy + Ra[7] * dz;
+        obs[base + i + 2] = Ra[2] * dx + Ra[5] * dy + Ra[8] * dz;
+      };
+      const rp = 3 * refs.pelvis, rl = 3 * refs.fistL, rr = 3 * refs.fistR;
+      put3(0, d.xpos[rp], d.xpos[rp + 1], d.xpos[rp + 2]);
+      const fv = refs.freeDof;
+      obs[base + 3] = Ra[0] * d.qvel[fv] + Ra[3] * d.qvel[fv + 1] + Ra[6] * d.qvel[fv + 2];
+      obs[base + 4] = Ra[1] * d.qvel[fv] + Ra[4] * d.qvel[fv + 1] + Ra[7] * d.qvel[fv + 2];
+      obs[base + 5] = Ra[2] * d.qvel[fv] + Ra[5] * d.qvel[fv + 1] + Ra[8] * d.qvel[fv + 2];
+      put3(6, d.xpos[rl], d.xpos[rl + 1], d.xpos[rl + 2]);
+      put3(9, d.xpos[rr], d.xpos[rr + 1], d.xpos[rr + 2]);
+      const yawSelf = yawOfQuat(tq[qo], tq[qo + 1], tq[qo + 2], tq[qo + 3]);
+      const yawOpp = yawOfQuat(tq[4 * refs.pelvis], tq[4 * refs.pelvis + 1],
+        tq[4 * refs.pelvis + 2], tq[4 * refs.pelvis + 3]);
+      const yawDiff = yawOpp - yawSelf;
+      obs[base + 12] = Math.sin(yawDiff);
+      obs[base + 13] = Math.cos(yawDiff);
+    }
+
     // last (smoothed) action
     obs.set(this.lastAction, o);
 
@@ -274,12 +428,19 @@ export class TrackingFighter {
     for (let i = 0; i < n; i++) if (!Number.isFinite(raw[i])) finite = false;
     this.healthy = finite;
     const beta = this.beta;
+    const cr = this.ctrlRange;
     for (let i = 0; i < n; i++) {
       const target = Math.max(-100, Math.min(100, raw[i]));
       this.actionRaw[i] = target;
       const sm = this.lastAction[i] + beta * (target - this.lastAction[i]);
       this.lastAction[i] = sm;
-      this.pdTarget[i] = sm * net.actionScale[i] + net.defaultQ[i];
+      // P-A：fight 模式按训练 ctrlrange 软窗夹紧 PD 目标位置（复刻训练侧
+      // position actuator 的 ctrl 夹紧；力矩仍由 writeTorque 的
+      // TRACKING_TORQUE_LIM 封顶，两窗语义不同勿混淆）。cr=null（guard/
+      // combo）走原表达式，字节不变。
+      this.pdTarget[i] = cr
+        ? Math.max(cr[2 * i], Math.min(cr[2 * i + 1], sm * net.actionScale[i] + net.defaultQ[i]))
+        : sm * net.actionScale[i] + net.defaultQ[i];
     }
 
     // advance the clip clock (refAt clamps; the scheduler decides what next)
