@@ -87,8 +87,11 @@
   #panel {
     position: absolute; left: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px;
     background: rgba(13,17,27,.82); padding: 12px 14px; border-radius: 12px;
-    backdrop-filter: blur(6px); font-size: 13px; min-width: 210px;
+    backdrop-filter: blur(6px); font-size: 13px; min-width: 300px; max-width: 340px;
+    max-height: calc(100vh - 140px); overflow-y: auto;
   }
+  #panel::-webkit-scrollbar { width: 8px; }
+  #panel::-webkit-scrollbar-thumb { background: #2a3348; border-radius: 4px; }
   #panel .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
   #panel label { color: #aab3c5; }
   button {
@@ -103,6 +106,46 @@
     color: #6f7890; font-size: 11.5px; line-height: 1.7; user-select: none;
   }
   #stats { position: absolute; left: 16px; top: 14px; font-size: 11px; color: #6f7890; line-height: 1.6; user-select: none; }
+
+  /* panel header（标题 + 更多模式 / 帮助） */
+  .panel-head { display: flex; align-items: center; justify-content: space-between; }
+  .panel-head .panel-title { font-size: 12.5px; font-weight: 600; letter-spacing: 1px; color: #cfd6e4; }
+  .panel-head button { font-size: 11px; padding: 2px 9px; border-radius: 6px; }
+
+  /* mode center */
+  .sec-title { font-size: 11px; color: #8a93a8; letter-spacing: 2px; }
+  .mode-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .mode-card { background: #1d2333; border: 1px solid #2a3348; border-radius: 8px;
+    padding: 6px 8px; cursor: pointer; transition: background .15s, border-color .15s; }
+  .mode-card:hover { background: #27304a; }
+  .mode-card .m-name { font-size: 12px; font-weight: 600; display: flex; align-items: center; gap: 5px; }
+  .mode-card .m-desc { font-size: 10.5px; color: #8a93a8; margin-top: 3px; line-height: 1.45; }
+  .mode-card .cur-badge { display: none; font-size: 9.5px; font-weight: 400; color: #d8b83a;
+    border: 1px solid rgba(216,184,58,.45); border-radius: 4px; padding: 0 4px; }
+  .mode-card.current, .mode-card.current:hover { background: #222a41; border-color: #d8b83a; cursor: default; }
+  .mode-card.current .cur-badge { display: inline-block; }
+  .mode-grid.flash .mode-card:not(.current) { animation: modeFlash 1.1s; }
+  @keyframes modeFlash { 0%, 55% { border-color: #d8b83a; } 100% { border-color: #2a3348; } }
+
+  /* debug / advanced group（视觉弱化，默认收起） */
+  details.debug { border: 1px solid #232b3d; border-radius: 8px; padding: 5px 9px; }
+  details.debug summary { cursor: pointer; font-size: 11.5px; color: #8a93a8; letter-spacing: 1px; user-select: none; }
+  details.debug .row { margin-top: 7px; }
+  details.debug button { font-size: 11px; padding: 4px 9px; }
+
+  /* first-run guide overlay */
+  #guideOverlay { position: fixed; inset: 0; z-index: 200; display: flex; align-items: center; justify-content: center;
+    background: rgba(5,8,14,.62); }
+  #guideOverlay.hidden { display: none; }
+  .guide-card { width: min(480px, 92vw); background: rgba(13,17,27,.95); border: 1px solid #2a3348;
+    border-radius: 14px; padding: 22px 24px; box-shadow: 0 12px 60px rgba(0,0,0,.55); }
+  .guide-card h2 { font-size: 19px; letter-spacing: 1px; margin-bottom: 8px; }
+  .guide-card .g-mode { font-size: 13px; color: #d8b83a; margin-bottom: 12px; }
+  .guide-card ul { list-style: none; display: flex; flex-direction: column; gap: 8px; margin-bottom: 16px; }
+  .guide-card li { font-size: 12.5px; color: #aab3c5; line-height: 1.6; position: relative; padding-left: 14px; }
+  .guide-card li::before { content: "·"; position: absolute; left: 2px; color: #d8b83a; font-weight: 700; }
+  .guide-card button { width: 100%; padding: 9px; font-size: 13.5px; font-weight: 600; border: none;
+    border-radius: 8px; background: linear-gradient(90deg, var(--red), var(--blue)); }
 </style>
 </head>
 <body>
@@ -133,32 +176,65 @@
   <div id="flash"></div>
 
   <div id="panel" class="clickable">
-    <div class="row"><label>仿真速度</label>
+    <div class="panel-head">
+      <span class="panel-title">G1 拳击控制台</span>
+      <span>
+        <button id="sceneBtn" title="高亮上方的模式中心，查看全部四种玩法">更多模式</button>
+        <button id="helpBtn" title="随时重看新手指南（不改变任何设置）">？</button>
+      </span>
+    </div>
+
+    <div class="sec-title">模式</div>
+    <div class="mode-grid" id="modeGrid">
+      <div class="mode-card" data-mode="fight" data-url="./index.html?scene=tracking&amp;fight=1"
+           title="切换到「真实对打」模式（切换模式将重新加载页面）">
+        <div class="m-name">真实对打<span class="cur-badge">当前</span></div>
+        <div class="m-desc">两台 G1 共享对打策略自主攻防，含 KO 与回合</div>
+      </div>
+      <div class="mode-card" data-mode="combo" data-url="./index.html?scene=tracking&amp;combo=1"
+           title="切换到「组合拳表演」模式（切换模式将重新加载页面）">
+        <div class="m-name">组合拳表演<span class="cur-badge">当前</span></div>
+        <div class="m-desc">双机循环演练 35 秒连续组合拳，纯观赏不记 KO</div>
+      </div>
+      <div class="mode-card" data-mode="guard" data-url="./index.html?scene=tracking"
+           title="切换到「守卫练习」模式（切换模式将重新加载页面）">
+        <div class="m-name">守卫练习<span class="cur-badge">当前</span></div>
+        <div class="m-desc">双机各自循环基础拳法片段，适合看清动作细节</div>
+      </div>
+      <div class="mode-card" data-mode="amo" data-url="./index.html"
+           title="切换到「AMO 自由模式」（切换模式将重新加载页面）">
+        <div class="m-name">AMO 自由模式<span class="cur-badge">当前</span></div>
+        <div class="m-desc">全身 RL 策略自由行走，最原始的开放场景</div>
+      </div>
+    </div>
+
+    <div class="row"><label title="调整仿真播放速度，0.25× 最慢、便于看清动作">仿真速度</label>
       <span><button data-speed="0.25">0.25×</button><button data-speed="0.5">0.5×</button><button data-speed="1" class="on">1×</button><button data-speed="2">2×</button></span>
     </div>
-    <div class="row"><label>攻击性</label><input type="range" id="aggr" min="0.5" max="2" step="0.1" value="1"></div>
-    <div class="row"><label>RL 策略</label>
-      <span><button id="rlABtn" class="on">A: AMO 策略</button><button id="rlBBtn" class="on">B: AMO 策略</button></span>
-    </div>
     <div class="row">
-      <button id="pauseBtn">暂停</button>
-      <button id="resetBtn">重置比赛</button>
+      <button id="pauseBtn" title="暂停 / 继续仿真，比分与计时同步冻结">暂停</button>
+      <button id="resetBtn" title="重置比赛：清空比分与回合数，双机回到起始姿势">重置比赛</button>
     </div>
+    <div class="row"><label>机器人策略</label>
+      <span><button id="rlABtn" class="on" title="点击切换该机器人：RL 策略 ⟷ 脚本模式（可作为对方陪练木桩）">A: AMO 策略</button><button id="rlBBtn" class="on" title="点击切换该机器人：RL 策略 ⟷ 脚本模式（可作为对方陪练木桩）">B: AMO 策略</button></span>
+    </div>
+    <div class="row"><label title="攻击性：数值越高，机器人出拳越积极">攻击性</label><input type="range" id="aggr" min="0.5" max="2" step="0.1" value="1" title="攻击性：数值越高，机器人出拳越积极"></div>
     <div class="row">
-      <button id="assistBtn" class="on">平衡辅助 开</button>
-      <button id="contactBtn">接触点 关</button>
+      <button id="orbitBtn" class="on" title="镜头自动绕擂台旋转；手动拖动画面会自动关闭环绕">镜头环绕 开</button>
+      <button id="tacticsBtn" disabled title="切换到训练好的战术 AI：出拳组合更有章法（权重文件缺失时此按钮自动隐藏）">战术 AI 关</button>
     </div>
-    <div class="row">
-      <button id="orbitBtn" class="on">镜头环绕 开</button>
-      <button id="evalCamBtn" title="固定评估机位（方案 §5：人工验收同一视角）">评估视角</button>
-    </div>
-    <div class="row">
-      <button id="tacticsBtn" disabled title="自博弈训练的战术策略（vendor/tactics/tactics.json）">战术 AI 关</button>
-      <button id="trailBtn" title="显示双机拳套最近 1.5s 轨迹（核对出拳指向）">拳套轨迹 关</button>
-    </div>
-    <div class="row">
-      <button id="sceneBtn" title="阶段4：29自由度追踪机器人 + 拳击片段策略（需 vendor/policy/boxing_*.bin）">追踪模式 关</button>
-    </div>
+
+    <details class="debug">
+      <summary title="调试与进阶观察工具，日常观看无需打开">调试 / 进阶</summary>
+      <div class="row">
+        <button id="assistBtn" class="on" title="平衡辅助：给机器人施加扶助力帮助站稳（仅脚本模式有效，RL 策略模式下不生效）">平衡辅助 开</button>
+        <button id="contactBtn" title="在画面中显示碰撞接触点，用于确认拳头命中判定">接触点 关</button>
+      </div>
+      <div class="row">
+        <button id="evalCamBtn" title="镜头一键切回固定裁判机位（截图 / 录像对比用同一视角）">评估视角</button>
+        <button id="trailBtn" title="在画面中画出拳套最近 1.5 秒的运动轨迹，核对出拳方向">拳套轨迹 关</button>
+      </div>
+    </details>
   </div>
   <div id="stats"></div>
   <div id="legend">
@@ -166,6 +242,21 @@
     红方 G1-A vs 蓝方 G1-B · Unitree G1<br>
     MuJoCo 3.13 WebAssembly + Three.js · 拳套/头部/躯干为碰撞体<br>
     AMO 模式：RSS 2025 全身 RL 策略自主平衡行走，无吊架 · 击中头部 +2 / 躯干 +1
+  </div>
+</div>
+
+<!-- 首次访问引导浮层：main.js 依据 localStorage 标记（g1boxing_seen_guide_v1）弹出，
+     「开始观看」关闭并写标记；面板右上「？」按钮可随时重看（重看不写标记） -->
+<div id="guideOverlay" class="hidden">
+  <div class="guide-card">
+    <h2>欢迎来到 G1 机器人拳击</h2>
+    <p class="g-mode" id="guideMode">当前模式：加载后自动识别</p>
+    <ul>
+      <li>比分、回合与 KO 全自动进行，无需任何操作，直接观看即可。</li>
+      <li>「A / B」按钮可单独切换每台机器人的 RL 策略或脚本模式（脚本模式可当对方的陪练木桩）。</li>
+      <li>左下角面板可切换四种玩法模式、调节速度与攻击性；调试工具收在「调试 / 进阶」里。</li>
+    </ul>
+    <button id="guideCloseBtn">开始观看</button>
   </div>
 </div>
 
@@ -177,6 +268,6 @@
   }
 }
 </script>
-<script type="module" src="./src/main.js?v=5"></script>
+<script type="module" src="./src/main.js?v=6"></script>
 </body>
 </html>

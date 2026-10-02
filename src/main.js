@@ -717,20 +717,6 @@ async function toggleAMO(side) {
 
 $('rlABtn').onclick = () => toggleAMO('A');
 $('rlBBtn').onclick = () => toggleAMO('B');
-// stage-4 toggle: reload with the tracking scene
-{
-  const sceneBtn = $('sceneBtn');
-  if (sceneBtn) {
-    sceneBtn.textContent = TRACKING ? '追踪模式 开' : '追踪模式 关';
-    sceneBtn.classList.toggle('on', TRACKING);
-    sceneBtn.onclick = () => {
-      const u = new URL(location);
-      if (TRACKING) u.searchParams.delete('scene');
-      else u.searchParams.set('scene', 'tracking');
-      location.href = u;
-    };
-  }
-}
 // reflect the default-on state in the buttons
 for (const side of ['A', 'B']) {
   const btn = $(side === 'A' ? 'rlABtn' : 'rlBBtn');
@@ -743,6 +729,57 @@ document.querySelectorAll('[data-speed]').forEach(b => {
     document.querySelectorAll('[data-speed]').forEach(x => x.classList.toggle('on', x === b));
   };
 });
+
+// ------------------------------------------------------------------ 模式中心 & 新手引导（纯 UI）
+// 模式中心：当前模式卡片高亮，其余卡片点击整页跳转。四种玩法对应不同场景
+// 模型与策略栈，切换必然重新加载页面（卡片 title 已注明）。currentMode 与
+// 图例 modeLine 同一判定源：fight 编译期常量只反映 meta 探测，运行时以
+// fightActive 为准（权重损坏回退后按追踪/守卫高亮，与 modeLine 一致）。
+const MODE_INFO = {
+  fight: '真实对打 —— 两台 G1 共享对打策略自主攻防，含 KO 与回合',
+  combo: '组合拳表演 —— 双机循环演练 35 秒连续组合拳，纯观赏不记 KO',
+  guard: '守卫练习 —— 双机各自循环基础拳法片段，适合看清动作细节',
+  amo: 'AMO 自由模式 —— 23 DoF 全身 RL 策略自由行走的开放场景',
+};
+const currentMode = FIGHT_MODE && fightActive ? 'fight' : COMBO_MODE ? 'combo' : TRACKING ? 'guard' : 'amo';
+const modeGrid = $('modeGrid');
+if (modeGrid) {
+  for (const card of modeGrid.querySelectorAll('.mode-card')) {
+    if (card.dataset.mode === currentMode) card.classList.add('current');
+    else card.addEventListener('click', () => { location.href = card.dataset.url; });
+  }
+}
+// sceneBtn（保留原 id）：旧「追踪模式 开/关」URL 开关与模式中心完全重复，
+// 改为「更多模式」——滚动到模式中心并高亮一闪，把视线引向模式卡片。
+const sceneBtn = $('sceneBtn');
+if (sceneBtn && modeGrid) {
+  sceneBtn.onclick = () => {
+    modeGrid.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    modeGrid.classList.remove('flash');
+    void modeGrid.offsetWidth;
+    modeGrid.classList.add('flash');
+  };
+}
+// 首次引导浮层：localStorage 无标记时在加载完成后弹出，「开始观看」关闭并
+// 写标记（隐私模式等 localStorage 异常一律静默降级：只是每次首屏都弹）。
+// 「？」按钮随时重看——重看不写标记，下次首访仍会弹。
+const GUIDE_KEY = 'g1boxing_seen_guide_v1';
+const guideOverlay = $('guideOverlay');
+if (guideOverlay) {
+  const guideMode = $('guideMode');
+  if (guideMode) guideMode.textContent = '当前模式：' + MODE_INFO[currentMode];
+  let guideFirstTime = false;
+  try { guideFirstTime = !localStorage.getItem(GUIDE_KEY); } catch { /* localStorage 不可用，按首访处理 */ }
+  if (guideFirstTime) guideOverlay.classList.remove('hidden');
+  $('guideCloseBtn').onclick = () => {
+    guideOverlay.classList.add('hidden');
+    if (guideFirstTime) {
+      try { localStorage.setItem(GUIDE_KEY, '1'); } catch { /* 写不进则下次首访仍弹 */ }
+      guideFirstTime = false;
+    }
+  };
+  $('helpBtn').onclick = () => guideOverlay.classList.remove('hidden');
+}
 window.addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
