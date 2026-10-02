@@ -100,6 +100,15 @@
   }
   button:hover { background: #27304a; }
   button.on { background: #2b4a8f; border-color: #3d63b8; }
+
+  /* 视频录制按钮：录制中变红并脉动 */
+  #recBtn.rec-on { background: #7a1f22; border-color: var(--red); color: #ffd9d9;
+    min-width: 92px; /* 录制中按钮只剩红点，锁定宽度接近待机态，避免布局跳动 */
+    animation: recPulse 1.1s ease-in-out infinite; }
+  @keyframes recPulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255,77,77,.5); }
+    50% { box-shadow: 0 0 0 7px rgba(255,77,77,0); }
+  }
   input[type=range] { width: 110px; accent-color: #4d7dff; }
   #legend {
     position: absolute; right: 16px; bottom: 16px; text-align: right;
@@ -214,6 +223,7 @@
     <div class="row">
       <button id="pauseBtn" title="暂停 / 继续仿真，比分与计时同步冻结">暂停</button>
       <button id="resetBtn" title="重置比赛：清空比分与回合数，双机回到起始姿势">重置比赛</button>
+      <button id="recBtn" title="一键录制当前画面为视频（含比分/回合/横幅与命中浮字），完成后自动下载；录制中按钮显示红点，再次点击即停止；切换模式或刷新会中断录制">● 录制视频</button>
     </div>
     <div class="row"><label>机器人策略</label>
       <span><button id="rlABtn" class="on" title="点击切换该机器人：RL 策略 ⟷ 脚本模式（可作为对方陪练木桩）">A: AMO 策略</button><button id="rlBBtn" class="on" title="点击切换该机器人：RL 策略 ⟷ 脚本模式（可作为对方陪练木桩）">B: AMO 策略</button></span>
@@ -268,6 +278,6 @@
   }
 }
 </script>
-<script type="module" src="./src/main.js?v=6"></script>
+<script type="module" src="./src/main.js?v=9"></script>
 </body>
 </html>

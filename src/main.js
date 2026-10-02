@@ -486,6 +486,7 @@ function banner(html, ms = 1400) {
   ui.banner.classList.add('show');
   clearTimeout(banner._t);
   banner._t = setTimeout(() => ui.banner.classList.remove('show'), ms);
+  recSnapshotBanner(ms); // 视频录制快照（低频调用；合成器按快照绘制横幅大字）
 }
 
 function worldToScreen(x, y, z) {
@@ -502,6 +503,7 @@ function floatText(text, color, wx, wy, wz) {
   el.style.cssText = `left:${px - 40}px;top:${py - 20}px;color:${color};`;
   $('hud').appendChild(el);
   setTimeout(() => el.remove(), 1000);
+  recFloats.push({ text, color, x: px - 40, y: py - 20, t0: performance.now() }); // 视频录制镜像（见下方"视频录制"节）
 }
 
 function flash(side) {
@@ -786,6 +788,329 @@ window.addEventListener('resize', () => {
   renderer.setSize(innerWidth, innerHeight);
 });
 
+// ------------------------------------------------------------------ 视频录制
+// 一键录制"所看到的"画面：渲染循环每帧把 three.js 画布与轻量 HUD（比分/命中、
+// 时间/回合、横幅大字、命中浮字）合成到一张离屏 2D canvas，再
+// captureStream(60) → MediaRecorder 编码保存。零外部依赖。
+//
+// 帧挂钩（侵入最小的方案）：frame() 内 renderer.render() 之后同步调用
+// recCompose()——同一任务内 WebGL 绘制缓冲仍有效（preserveDrawingBuffer=false
+// 下跨任务 drawImage 会读到已清空的缓冲），watchdog 兜底帧同样被覆盖；未录制
+// 时 recCompose() 只是一次布尔短路。模式切换/刷新是整页跳转，录制随页面卸载
+// 自然中断，无需挂钩模式卡片。
+const REC_MIMES = [
+  'video/mp4;codecs="avc1.640028"',   // H.264 High 档，同码率画质最好，探测失败自动回退
+  'video/mp4;codecs="avc1.42E01E"',
+  'video/mp4',
+  'video/webm;codecs=h264',
+  'video/webm;codecs=vp9',
+  'video/webm',
+];
+const recMime = typeof MediaRecorder !== 'undefined'
+  ? REC_MIMES.find(m => MediaRecorder.isTypeSupported(m)) || null
+  : null;
+const recCssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const REC_COLOR_BG = recCssVar('--bg') || '#0b0e14';
+const REC_COLOR_RED = recCssVar('--red') || '#ff4d4d';
+const REC_COLOR_BLUE = recCssVar('--blue') || '#4d7dff';
+// 横幅行内色可能是 CSS 变量（canvas 不认识 var(...)），换算成具体色值
+const recResolveColor = c => {
+  if (!c) return null;
+  const m = /^var\(--([a-z]+)\)/.exec(c);
+  if (!m) return c;
+  return { red: REC_COLOR_RED, blue: REC_COLOR_BLUE }[m[1]] || null;
+};
+
+let recState = 'idle';   // idle | recording | stopping
+let recorder = null;
+let recChunks = [];
+let recLastBlob = null;
+let recStartT = 0;       // performance.now() 起点（停止后 banner 报告录制时长用）
+let recTick = null;      // 录制中按钮刷新 interval
+let recFonts = null;     // 按 start 时缩放预生成的 font 串（避免每帧构造/measureText）
+const recFloats = [];    // 命中浮字录制镜像 {text,color,x,y,t0}（floatText 推入）
+let recBanner = null;    // 横幅快照 {lines:[{text,small,color}], t0, ms}
+
+// 离屏合成画布：尺寸取录制开始时的渲染画布设备像素；录制中途窗口缩放只做
+// 缩放绘制（流分辨率稳定，避免编码器中途改分辨率）。alpha:false 直接给编码器
+// 不透明帧，也省去透明合成开销。
+const compCanvas = document.createElement('canvas');
+const compCtx = compCanvas.getContext('2d', { alpha: false });
+
+// banner() 钩子：把当前横幅内容解析成行快照（banner() 低频调用，解析开销可忽略）。
+// <br> 与 .small（display:block）都换行；行内 style 的 color 解析成画布可用色。
+function recSnapshotBanner(ms) {
+  const lines = [];
+  let cur = null;
+  const flush = () => { if (cur && cur.text.trim()) lines.push(cur); cur = null; };
+  const walk = node => {
+    for (const child of node.childNodes) {
+      if (child.nodeType === 3) {                     // 文本节点
+        if (!cur) cur = { text: '', small: false, color: null };
+        cur.text += child.textContent;
+      } else if (child.nodeType === 1) {              // 元素节点
+        if (child.tagName === 'BR') { flush(); continue; }
+        const small = child.classList.contains('small');
+        if (small && cur) flush();
+        if (!cur) cur = { text: '', small, color: null };
+        const style = child.getAttribute('style');
+        if (style) {
+          const cm = /color:\s*([^;]+)/.exec(style);
+          if (cm && !cur.color) cur.color = recResolveColor(cm[1].trim());
+        }
+        walk(child);
+      }
+    }
+  };
+  walk(ui.banner);
+  flush();
+  recBanner = lines.length ? { lines, t0: performance.now(), ms } : null;
+}
+
+function buildRecFonts(k) {
+  const fam = '"Segoe UI", "Microsoft YaHei", system-ui, sans-serif';
+  return {
+    name: `600 ${14 * k}px ${fam}`,
+    pts: `700 ${30 * k}px ${fam}`,
+    sub: `${11 * k}px ${fam}`,
+    clock: `700 ${24 * k}px ${fam}`,
+    banner: `800 ${54 * k}px ${fam}`,
+    bannerSmall: `500 ${20 * k}px ${fam}`,
+    float: `800 ${22 * k}px ${fam}`,
+  };
+}
+
+// 记分板（与 DOM 同数据源：textContent + refreshScore 同式的 ctl.damage）
+function drawRecScoreboard(ctx, k) {
+  const boxW = 170 * k, boxH = 94 * k, clockW = 96 * k, gap = 2 * k, top = 14 * k;
+  const x0 = (compCanvas.width - (boxW * 2 + clockW + gap * 2)) / 2;
+  const box = (x, color, name, pts, hits, hpPct) => {
+    ctx.fillStyle = 'rgba(13,17,27,.82)';
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(x, top, boxW, boxH, [10 * k, 10 * k, 0, 0]);
+    else ctx.rect(x, top, boxW, boxH);
+    ctx.fill();
+    ctx.fillStyle = color;
+    ctx.fillRect(x, top, boxW, 3 * k);
+    const tx = x + 18 * k;
+    ctx.textAlign = 'left';
+    ctx.fillStyle = color;
+    ctx.font = recFonts.name; ctx.fillText(name, tx, top + 24 * k);
+    ctx.font = recFonts.pts;  ctx.fillText(pts, tx, top + 58 * k);
+    ctx.fillStyle = '#8a93a8';
+    ctx.font = recFonts.sub;  ctx.fillText('命中 ' + hits, tx, top + 77 * k);
+    const barW = boxW - 36 * k;
+    ctx.fillStyle = '#1d2333'; ctx.fillRect(tx, top + 82 * k, barW, 5 * k);
+    ctx.fillStyle = color;     ctx.fillRect(tx, top + 82 * k, barW * hpPct / 100, 5 * k);
+  };
+  const clockX = x0 + boxW + gap;
+  ctx.fillStyle = 'rgba(13,17,27,.82)';
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(clockX, top, clockW, boxH, 10 * k);
+  else ctx.rect(clockX, top, clockW, boxH);
+  ctx.fill();
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#e8eaf0';
+  ctx.font = recFonts.clock; ctx.fillText(ui.time.textContent, clockX + clockW / 2, top + 44 * k);
+  ctx.fillStyle = '#8a93a8';
+  ctx.font = recFonts.sub;   ctx.fillText('回合 ' + ui.round.textContent, clockX + clockW / 2, top + 70 * k);
+  box(x0, REC_COLOR_RED, '红方 · G1-A', ui.ptsA.textContent, ui.hitsA.textContent,
+    Math.max(0, 100 - ctl.damage.A * 20));
+  box(clockX + clockW + gap, REC_COLOR_BLUE, 'G1-B · 蓝方', ui.ptsB.textContent, ui.hitsB.textContent,
+    Math.max(0, 100 - ctl.damage.B * 20));
+}
+
+// 横幅大字：透明度直接读 #banner 的计算样式（与 CSS 过渡实时同步），位置按
+// DOM 的 top:34% 居中；行快照来自 recSnapshotBanner。
+function drawRecBanner(ctx, k, now) {
+  if (!recBanner || recBanner.t0 + recBanner.ms + 200 < now) return;
+  const alpha = Number(getComputedStyle(ui.banner).opacity);
+  if (alpha < 0.02) return;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.textAlign = 'center';
+  ctx.shadowColor = 'rgba(0,0,0,.7)';
+  ctx.shadowBlur = 30 * k;
+  if ('letterSpacing' in ctx) ctx.letterSpacing = (6 * k) + 'px';
+  const cx = compCanvas.width / 2;
+  const rows = recBanner.lines.map(l => ({ ...l, h: (l.small ? 26 : 60) * k }));
+  const total = rows.reduce((s, r) => s + r.h, 0);
+  let y = compCanvas.height * 0.34 - total / 2;
+  for (const r of rows) {
+    y += r.h * 0.7;
+    ctx.font = r.small ? recFonts.bannerSmall : recFonts.banner;
+    if ('letterSpacing' in ctx) ctx.letterSpacing = ((r.small ? 3 : 6) * k) + 'px';
+    ctx.fillStyle = r.small ? '#cfd6e4' : (r.color || '#e8eaf0');
+    ctx.fillText(r.text.trim(), cx, y);
+    y += r.h * 0.3;
+  }
+  ctx.restore();
+  if ('letterSpacing' in ctx) ctx.letterSpacing = '0px';
+}
+
+// 命中浮字：按 floatUp 动画复刻（15% 淡入回位，之后上浮 46px 淡出；DOM 的
+// scale 微差省略），坐标为 worldToScreen 的 CSS px × k。
+function drawRecFloats(ctx, k, now) {
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,.8)';
+  ctx.shadowBlur = 8 * k;
+  ctx.textAlign = 'left';
+  for (let i = recFloats.length - 1; i >= 0; i--) {
+    const f = recFloats[i];
+    const age = (now - f.t0) / 1000;
+    if (age >= 1) { recFloats.splice(i, 1); continue; }
+    const p = age < 0.15 ? age / 0.15 : 1;
+    const out = age < 0.15 ? 0 : (age - 0.15) / 0.85;
+    ctx.globalAlpha = p * (1 - out);
+    ctx.fillStyle = f.color;
+    ctx.font = recFonts.float;
+    ctx.fillText(f.text, f.x * k, (f.y + 19 + (1 - p) * 6 - out * 46) * k);
+  }
+  ctx.restore();
+}
+
+// 每帧合成（frame() 内 renderer.render() 之后调用；未录制时布尔短路）
+function recCompose() {
+  if (recState !== 'recording') return;
+  try {
+    const ctx = compCtx, W = compCanvas.width, H = compCanvas.height;
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = REC_COLOR_BG;          // WebGL 画布透明区域在 DOM 下是 --bg
+    ctx.fillRect(0, 0, W, H);
+    ctx.drawImage(renderer.domElement, 0, 0, W, H);
+    const k = W / innerWidth;
+    drawRecScoreboard(ctx, k);
+    drawRecBanner(ctx, k, performance.now());
+    drawRecFloats(ctx, k, performance.now());
+  } catch (err) {
+    console.error('recCompose failed', err);   // 合成失败不影响仿真帧循环
+  }
+}
+
+function recStamp() {
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+function recUpdateBtn() {
+  // 录制中按钮只显示红点（rec-on 红色脉动），不显示状态词/时长；
+  // 时长计数由 recStartT 保留，停止后 recFinalize 的 banner 用它报告录制时长
+  recBtn.textContent = '●';
+}
+
+// 只清录制侧状态与 UI；正常收尾走 onstop → recFinalize → recTeardown，
+// 出错路径直接调用（先摘 handler 再停轨，不会误触发 recFinalize）。
+function recTeardown() {
+  if (recTick) { clearInterval(recTick); recTick = null; }
+  if (recorder) {
+    const stream = recorder.stream;
+    recorder.ondataavailable = null; recorder.onerror = null; recorder.onstop = null;
+    recorder = null;
+    if (stream) for (const t of stream.getTracks()) t.stop();
+  }
+  recState = 'idle';
+  recBtn.disabled = false;
+  recBtn.classList.remove('rec-on');
+  recBtn.textContent = '● 录制视频';
+}
+
+function recStart() {
+  if (recState !== 'idle') return false;
+  if (typeof MediaRecorder === 'undefined' || !recMime || !compCanvas.captureStream) {
+    banner('<span style="color:var(--red)">当前浏览器不支持视频录制</span>', 3000);
+    return false;
+  }
+  compCanvas.width = renderer.domElement.width;
+  compCanvas.height = renderer.domElement.height;
+  // 码率按画布高度自适应：≥1440 24Mbps / ≥1080 16Mbps / ≥720 10Mbps / 其余 6Mbps
+  const bitrate = compCanvas.height >= 1440 ? 24e6 : compCanvas.height >= 1080 ? 16e6 : compCanvas.height >= 720 ? 10e6 : 6e6;
+  recFonts = buildRecFonts(compCanvas.width / innerWidth);
+  recChunks = [];
+  recFloats.length = 0;
+  recBanner = null;
+  try {
+    recorder = new MediaRecorder(compCanvas.captureStream(60), {
+      mimeType: recMime, videoBitsPerSecond: bitrate,
+    });
+  } catch (err) {
+    console.error('MediaRecorder 创建失败', err);
+    banner('<span style="color:var(--red)">录制启动失败</span><span class="small">' +
+      String(err && err.message || err) + '</span>', 4000);
+    return false;
+  }
+  recorder.ondataavailable = e => { if (e.data && e.data.size) recChunks.push(e.data); };
+  recorder.onerror = e => {
+    console.error('MediaRecorder error', e.error || e);
+    banner('<span style="color:var(--red)">录制出错，已终止</span><span class="small">' +
+      String(e.error && e.error.message || '编码器异常') + '</span>', 4000);
+    recTeardown();
+  };
+  recorder.onstop = recFinalize;
+  recorder.start(1000);   // 每秒一个 chunk，异常中断也能保住已录内容
+  recStartT = performance.now();
+  recState = 'recording';
+  recBtn.classList.add('rec-on');
+  recUpdateBtn();
+  recTick = setInterval(recUpdateBtn, 500);
+  return true;
+}
+
+function recStop() {
+  if (recState !== 'recording') return false;
+  recState = 'stopping';
+  recBtn.disabled = true;
+  try {
+    recorder.stop();          // onstop → recFinalize 收尾
+  } catch (err) {
+    console.error('recorder.stop failed', err);
+    recFinalize();
+  }
+  return true;
+}
+
+function recFinalize() {
+  const durMs = Math.max(0, performance.now() - recStartT);
+  recTeardown();
+  try {
+    const blob = new Blob(recChunks, { type: recMime });
+    recChunks = [];
+    recLastBlob = blob;
+    const ext = recMime.startsWith('video/mp4') ? 'mp4' : 'webm';
+    const name = `g1-boxing-${recStamp()}.${ext}`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);   // 留缓冲，防下载未起即吊销
+    const webmNote = ext === 'webm'
+      ? '<span class="small">当前浏览器不支持 MP4 直录，已保存 WebM</span>' : '';
+    banner(`已保存 ${name}（${(blob.size / 1048576).toFixed(1)} MB · ${(durMs / 1000).toFixed(1)} 秒）${webmNote}`, 4200);
+  } catch (err) {
+    console.error('录制文件生成失败', err);
+    banner('<span style="color:var(--red)">录制文件生成失败</span>', 3000);
+  }
+}
+
+const recBtn = $('recBtn');
+if (recBtn) {
+  recBtn.onclick = () => {
+    if (recState === 'recording') recStop();
+    else if (recState === 'idle') recStart();
+  };  // stopping 期间的点击忽略
+}
+
+// 调试句柄（仿 window.__box）：供无 DOM 自动化验收——start/stop/state()/mime/lastBlob
+window.__rec = {
+  start: () => (recState === 'idle' ? recStart() : false),
+  stop: () => (recState === 'recording' ? recStop() : false),
+  state: () => recState,
+  mime: recMime,
+  get lastBlob() { return recLastBlob; },
+};
+
 // ------------------------------------------------------------------ main loop
 let last = performance.now();
 let acc = 0;
@@ -817,6 +1142,7 @@ function frame(now) {
     updateFistTrails();
     handleEvents();
     renderer.render(scene, camera);
+    recCompose();   // 视频录制合成挂钩（帧末；未录制时是一次布尔短路）
 
     fpsN++; fpsT += dtWall;
     if (fpsT >= 0.5) {
