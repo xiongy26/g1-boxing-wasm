@@ -92,6 +92,135 @@ const FIGHT_SPAWN_JITTER = [
   { dx: 0.000, dy: -0.020, yaw: 0.015 },
 ];
 
+// FIGHT 航向伺服（H1/H2 修复，2026-10-01）：δ=yawOffset 令"参考片段朝向+δ"
+// 始终对准对手，同时作用于观测侧（policyTick 的 _qz 参考旋转）与状态侧
+// （rebaseToReference 的 Rz 链路）——两侧共用同一 δ 保证自洽，见
+// fightRebaseDelta / updateFightHeadingServo。默认开启；FIGHT_HEADING_SERVO=0
+// 或构造项 headingServo=false 关闭（code-review 的 A/B 基线对比用）。τ 默认
+// 0.3s（方案给定区间 [0.2,0.5] 的中值），FIGHT_HEADING_TAU 或构造项
+// headingTau 可覆盖（夹紧 [0.05,2.0]s，覆盖参考片段自身 ±3 rad/s 的 yaw 摆
+// 速带宽）。浏览器以原生 ES Module 加载本文件（无 process），env 读取带
+// typeof 守卫。
+const HEADING_SERVO_DEFAULT =
+  typeof process === 'undefined' || !process.env || process.env.FIGHT_HEADING_SERVO === undefined
+    ? true
+    : process.env.FIGHT_HEADING_SERVO !== '0';
+const HEADING_TAU_DEFAULT = (() => {
+  const v = typeof process === 'undefined' || !process.env ? NaN : Number(process.env.FIGHT_HEADING_TAU);
+  return Number.isFinite(v) && v > 0 ? Math.min(2.0, Math.max(0.05, v)) : 0.3;
+})();
+
+// ---- FIGHT 视觉形态修复（2026-10-02，路线 A 运行时层）----------------------
+// 队长侦察证据（浏览器 4 回合截图）：贴脸缠抱、抱架丢失（双臂垂下）、双臂
+// 对称前推、原地站桩。fight 参考动作自身即缺陷源（boxing_fight.bin 参考帧
+// 大多双拳前伸 ~0.33m、末段垂手 el≈1.56——策略忠实跟踪即摆出摔跤/人偶形
+// 态）。三项运行时对策，浏览器与 headless 共用本实现（无 harness 特判）：
+//  1) 守卫混合：非出拳手臂的 PD 目标向高抱架目标混合（applyFightGuard 经
+//     TrackingFighter.targetHook 逐物理步生效；第 2 轮 P0-2 修订为"覆写边界
+//     按持久混合水平重混 + 窗口内指数微调"两级结构，见常量区与
+//     applyFightGuard 注释）；第 4 轮 P0-2 追加臂关节重力前馈（随 guardMix
+//     缩放，同一写入路径，见 FIGHT_GUARD_FEEDFORWARD）；出拳判定（该臂拳速
+//     EMA 超阈）期间该臂完全交还策略——出拳→收拳自动回抱架。
+//  2) 裁判分离力：躯干水平间距过近时对双方骨盆施加水平分离力（combo 模式
+//     "缠斗分离"先例的 fight 版），按深度比例、限幅、计量（fightForceUsage）。
+//  3) 距离保持力：间距过远时施加温和接近力，制造可感知的进退步法；过远
+//     僵局重置（>1.9m/3s）保留兜底。
+// 守卫关节目标选值依据（scene_boxing_tracking.xml 左臂链 FK，torso 系，第 4
+// 轮 P0-2 el 加深后数值）：
+//   sp=-0.88 sr=-0.05 sy=-0.10 el=-0.60 → 拳套 (0.195, 0.070, 0.399)，头 site
+//   在 z=0.430 —— 拳套近头高（|拳-头z|=0.031）、高于肘 +0.26（探针两腿均
+//   脱离边际，抱架形态）。右臂镜像（roll/yaw 反号，sp/el 同值）。el 为负是
+//   屈臂方向（参考数据 el min=-0.02 从不屈臂，-0.60 越界 0.58rad，肘关节限位
+//   -1.0472 内）。对照旧值 el=-0.35：拳套 (0.256, 0.052, 0.379)、高于肘
+//   +0.24——第 3 轮终验诊断臂关节执行端跟踪亏差（肩 pitch 实际 p50 较指令低
+//   0.15-0.27rad ≈ 重力矩/kp），加深屈肘直接抬拳套、缩短前臂重力臂，与重力
+//   前馈（FIGHT_GUARD_FEEDFORWARD）同向合围。
+// 部署的 boxing_guard 片段参考手臂即默认垂手站姿（不可用作守卫目标），故
+// 目标为常量表而非片段采样。
+// 出拳判定阈值同时是 tools/test_tracking_boxing.mjs 抱架保持率指标的
+// "非出拳状态"定义（同一常量，指标与控制自洽）。判定只用拳速、不用前向
+// 伸距：fight 参考帧双拳常驻前伸 0.29-0.42m，骑在 any 伸距阈值上会让门禁
+// 抖振（且参考保持段伸距 0.38-0.42 会让门禁常开、抱架永远混不进去）。
+// 第 2 轮 P0-2（2026-10-02 审查）根因 1——过触发：0.6 阈值下参考跟踪的常规
+// 摆臂 EMA 也常越阈（实测"出拳中"占比 ~50%，而 60s 仅 9 次命中），守卫混合
+// 一半时间被挂起。提到 1.2 m/s：真出拳 2-4 m/s（EMA τ~16ms，出手即远超阈），
+// 参考跟踪/贴身挤压臂速 <1 m/s，单阈值恢复干净分离。指标分母口径随本常量
+// 自动同源收紧——新口径：任一臂拳速 EMA >1.2 m/s 才算"出拳中"。
+export const FIGHT_PUNCH_SPEED = 1.2;    // 拳速 EMA 超此值 (m/s) = 出拳中
+const FIGHT_GUARD_TAU = 0.20;            // 覆写窗口内的守卫微调时间常数 (s)
+// 第 2 轮 P0-2（2026-10-02 审查）根因 2——覆写重置：policyTick 每
+// FIGHT_POLICY_DECIMATION 物理步整体重写 pdTarget，逐帧指数混合在覆写窗口
+// 内累计仅 ~9.5%（α=1−e^(−0.005/0.2)≈0.025 × 4 步），持续 ≥0.5s 非出拳窗口
+// 的抱架探针通过率仅 41-54%（仅调 FIGHT_GUARD_TAU 无效：每步 α 恒 0.025，
+// 瓶颈在覆写把爬坡归零）。改为主从两级混合：
+//  - 持久混合水平 guardMix（per-arm，存 Fighter）：非出拳每步向 MIX_MAX 指数
+//    回升（τ=MIX_TAU），出拳瞬间清零——水平跨覆写窗口持久，不每窗口爬坡；
+//  - 应用：覆写边界按当前水平一次性重混（稳态边界 = MIX_MAX 抱架——第 2 轮
+//    取 70% 时审查建议 30-50% 边界混合取上沿并稳态保持；窗口内在边界结果上
+//    继续 τ=FIGHT_GUARD_TAU 指数微调）。
+// 第 3 轮 P0-2（2026-10-02 复验）：0.70 稳态混合实测仅把 guard-hold 托到 56%
+// （<70% 门槛）。提到 0.8：scene_boxing_tracking.xml 左臂链 FK（校准复现第 1
+// 轮注释值——纯守卫目标拳套 z≈0.38、高于肘≈0.23）估算混合稳态：最差策略姿态
+// （参考末段垂手 el=1.56）下拳-肘 Δz +0.085→+0.147，|拳-头| 0.233→0.16m——
+// 探针第二腿 |拳-头|≤0.25m 在低姿态才是紧约束，两项同时脱离边际。勿超 0.85
+// （再高接近完全接管手臂，伤出拳真实感）。0.8 已把最差姿态托过探针线（Δz
+// +0.147 > +0.03）；第 4 轮 P0-2 启用其时预留的剩余杠杆——el 加深至 -0.6
+// （FIGHT_GUARD_JOINTS，最差混合姿态 |拳-头z| 0.166→0.125、高于肘
+// +0.150→+0.190）+ 臂关节重力前馈（FIGHT_GUARD_FEEDFORWARD），不再动 MIX_MAX。
+const FIGHT_GUARD_MIX_MAX = 0.8;
+const FIGHT_GUARD_MIX_TAU = 0.10;        // 出拳结束后混合水平回升时间常数 (s)
+//                              （第 3 轮 0.15→0.10：清零后 0.23s 回升到 90%
+//                              水平、0.30s 到 95%，压缩出拳判定结束后守卫
+//                              尚未回位的低混合尾窗——尾窗即保持率的 FAIL 段）
+// policyTick 抽取倍率（tracking_policy.mjs physicsStep 的 decimation 实参，
+// 200Hz 物理 / 50Hz 策略）。applyFightGuard 以 stepCount % 本值 === 0 判定
+// "pdTarget 刚被 policyTick 覆写"（钩子在覆写之后、stepCount 自增之前调用，
+// 见 physicsStep）；唯一调用点 update() 的 physicsStep(FIGHT_POLICY_DECIMATION)
+// 与此同源，改抽取率只动这一处常量。
+const FIGHT_POLICY_DECIMATION = 4;
+const FIGHT_GUARD_JOINTS = {
+  left_shoulder_pitch_joint: -0.88, left_shoulder_roll_joint: -0.05,
+  left_shoulder_yaw_joint: -0.10, left_elbow_joint: -0.6,
+  left_wrist_roll_joint: 0, left_wrist_pitch_joint: 0, left_wrist_yaw_joint: 0,
+  right_shoulder_pitch_joint: -0.88, right_shoulder_roll_joint: 0.05,
+  right_shoulder_yaw_joint: 0.10, right_elbow_joint: -0.6,
+  right_wrist_roll_joint: 0, right_wrist_pitch_joint: 0, right_wrist_yaw_joint: 0,
+};
+// 第 4 轮 P0-2（2026-10-02 队长裁决）：臂关节重力前馈（guard-hold 决胜轮）。
+// 第 3 轮终验诊断：混合强度已不是瓶颈（非出拳时段 guardMix≥0.7 占 79-87%），
+// 根因是臂关节执行端跟踪亏差——肩 pitch 指令 p50 -0.91~-1.00 vs 实际
+// -0.63~-0.76（亏 0.15-0.27rad × kp 14.25 ≈ 2.1-3.8 N·m），肘指令
+// -0.27~-0.35 vs 实际 -0.15~-0.22。模型静态核验（qfrc_bias，v=0 即纯重力
+// 广义力，guard 姿态/垂姿 p50 双点）与亏差×kp 相互印证：肩 pitch 3.82/4.11
+// N·m（亏差主因即重力），肘 0.40/1.44（前臂越垂重力臂越长）。
+// 幅值表（单位 N·m，可调常量；写入见 applyFightGuard，经 TrackingFighter
+// .extraTorque 加性通道在 writeTorque 限幅前叠加）：
+//   shoulder_pitch ±3.5 —— 重力矩 3.82-4.11 的上段；×guardMix 稳态(0.8)施加
+//     2.8，残差 ≤(4.11-2.8)/14.25≈0.09rad（原亏差 0.15-0.27），配合 el 加深
+//     合围；单项 < 4 N·m 护栏，远低 25 N·m 限幅。
+//   elbow ±1.4 —— 垂姿重力矩 1.44（亏差×kp 1.57-1.85 的主部）；稳态施加
+//     1.12，残差 ~0.02rad。守卫姿态重力矩仅 0.40，超额部分即回收期抗垂余量。
+//   roll/yaw 0 —— 模型重力矩 |0.21-0.25| N·m（<限幅 1%），诊断亏差亦集中于
+//     pitch/肘，不补。
+// 方向：肩 pitch/肘负向 = 抬臂/屈肘，恰为重力下垂（正向）的反向。腕不进表
+// （前馈只作用臂关节 8 项）。力矩 = k × guardMix 随混合缩放：出拳判定瞬间
+// guardMix 清零 → 前馈同步为零（applyFightGuard 出拳分支显式清零该臂，钩子
+// 每物理步先清后写、早退路径整表清零，无滞后残留），策略出拳动力学不受影响。
+const FIGHT_GUARD_FEEDFORWARD = {
+  left_shoulder_pitch_joint: -3.5, left_elbow_joint: -1.4,
+  right_shoulder_pitch_joint: -3.5, right_elbow_joint: -1.4,
+};
+// 裁判分离力：间距 < SEP_DIST 起作用，力 = K·(SEP_DIST−d)，限幅 FMAX
+const FIGHT_SEP_DIST = 0.42;
+const FIGHT_SEP_K = 260;      // N/m
+const FIGHT_SEP_FMAX = 80;    // N（与 combo 缠斗分离同上限）
+// 距离保持力：间距 > APPR_DIST 起作用，力 = K·(d−APPR_DIST)，限幅 FMAX
+// （<6% 体重，接触鲁棒训练分布内的温和扰动；仅制造进退，不推动平衡）
+const FIGHT_APPR_DIST = 1.25;
+const FIGHT_APPR_K = 70;      // N/m
+const FIGHT_APPR_FMAX = 28;   // N
+
+
 // FIGHT PD 目标位置夹紧窗（P-A，终审第 3 轮）：复刻训练侧 position actuator
 // 的 ctrlrange 夹紧——训练 ctrl 目标被 mjlab 软窗夹住，浏览器 JS PD 原本无
 // 此约束（力矩限幅是另一回事，勿与 TRACKING_TORQUE_LIM 混淆）。
@@ -297,12 +426,17 @@ class Fighter {
     this.noPunchUntil = -1e9;   // 出拳禁止窗口（回合稳定期 + 片段间冷却）
     this.fistSpeed = { left: 0, right: 0 };   // EMA 拳速 (m/s)，命中判定用
     this._fistPrev = { left: null, right: null, t: null };
+    // FIGHT 守卫混合的 per-arm 持久水平（[0, FIGHT_GUARD_MIX_MAX]，第 2 轮
+    // P0-2 的跨覆写窗口偏置；仅 applyFightGuard 读写）。resetRound/divergence
+    // 自愈有意不清零：回合重置/回绕后立即以稳态强度回抱架。非 fight 模式
+    // 恒 {left:0,right:0} 不被读，零影响。
+    this.guardMix = { left: 0, right: 0 };
   }
 }
 
 // ---- controller -------------------------------------------------------------
 export class BoxingController {
-  constructor(model, data, { mujoco, ids, assist = true, aggression = 1, rng = Math.random, trackingAssist = false, comboMode = false, faceoff = false, fightMode = false }) {
+  constructor(model, data, { mujoco, ids, assist = true, aggression = 1, rng = Math.random, trackingAssist = false, comboMode = false, faceoff = false, fightMode = false, headingServo, headingTau }) {
     this.model = model;
     this.data = data;
     this.mujoco = mujoco;
@@ -334,6 +468,18 @@ export class BoxingController {
     // 非 fight 模式这两个状态只被写不被读。
     this._roundNo = 0;
     this._fightPhase = { A: 0, B: FIGHT_PHASE_OFFSETS[0] };
+    // FIGHT 航向伺服开关与时间常数（见 HEADING_SERVO_DEFAULT 注释）。构造项
+    // 未给时才落 env/默认——显式传入 false 的 A/B 基线优先于 env。
+    this.headingServo = headingServo ?? HEADING_SERVO_DEFAULT;
+    this.headingTau = headingTau ?? HEADING_TAU_DEFAULT;
+    // 伺服每物理步要用双方 torso 世界位姿，body id 一次性解析缓存（原
+    // rebaseYawDelta 的逐次 name2id 语义不变，仅伺服路径走缓存）。
+    this._torsoBody = {};
+    for (const side of ['A', 'B']) {
+      const tb = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY.value, side + '_torso_link');
+      if (tb < 0) throw new Error('torso body not found: ' + side);
+      this._torsoBody[side] = tb;
+    }
     // §4.6：追踪片段策略是无外力训练的，外部扶正/阻尼与片段动力学直接对抗
     // （实测真辅助让出拳段摔得更快）。默认关断，只对脚本回退模式生效；
     // 将来训练"带辅助课程"的策略后再开（trackingAssist=true）。
@@ -403,6 +549,17 @@ export class BoxingController {
       B: { fx: 0, fy: 0, fz: 0, tx: 0, ty: 0, tz: 0 },
     };
     this._lastAssistSample = { t: 0, A: null, B: null };
+    // FIGHT 裁判分离力/距离保持力计量（|F|·dt 积分，N·s）：与平衡辅助
+    // assistUsage 分开——fight 模式 assist 默认关，assistUsage 恒 0，这两项
+    // 是 fight 形态整形力的透明账目（回归输出报告）。第 4 轮 P0-2 增 ff：
+    // 守卫臂关节重力前馈用量（Σ|τ|·dt，N·m·s，applyFightGuard 写入处累加）。
+    this.fightForceUsage = {
+      A: { sx: 0, sy: 0, ax: 0, ay: 0, ff: 0 },
+      B: { sx: 0, sy: 0, ax: 0, ay: 0, ff: 0 },
+    };
+    // FIGHT 守卫混合的一次性缓存（fight net meta 的关节序 → 守卫目标向量 +
+    // 左右臂索引表），首次 _attachFightGuard 时构建（A/B 共用同一 fight net）。
+    this._fightGuard = null;
   }
 
   // ---- AMO mode ---------------------------------------------------------------
@@ -461,7 +618,12 @@ export class BoxingController {
     // 反镜像：B 机参考起始帧 = 本回合相位偏移（_fightPhase，A 恒 0）——训练
     // RSI 随机起始帧的确定性等价物，打破双机镜像锁定。
     const phase = startClip === 'fight' ? this._fightPhase[side] : 0;
-    const delta = startClip === 'combo' ? this.comboDelta(side, startNet) : this.rebaseYawDelta(side, startNet, phase);
+    // fight + 伺服：启动 δ0 = bearing − 参考相位帧 yaw（出生位 ±0.6 面对面，
+    // A bearing≈0 / B≈π，启动即面向对手）；伺服关闭回 rebaseYawDelta 旧基准
+    // （当前朝向），A/B 基线路径字节不变。
+    const delta = startClip === 'combo' ? this.comboDelta(side, startNet)
+      : startClip === 'fight' && this.headingServo ? this.fightRebaseDelta(side, startNet, phase)
+      : this.rebaseYawDelta(side, startNet, phase);
     // faceoff 修正公式（世界系 Rz 前乘）在 fight 下双侧启用：fight 重锚定角
     // 非零（B≈π、A=−ref0 yaw），且 fight ref0 基座可能带俯仰——遗留体轴后乘
     // 与 policyTick 观测旋转（Rz 前乘）不互逆，anchor-ori 观测会泄漏（
@@ -484,6 +646,8 @@ export class BoxingController {
       // （±1.2m / ±0.6m），setTracking 不再做额外推挤。
       this.mujoco.mj_forward(this.model, this.data);
     }
+    // FIGHT 守卫混合钩子（非 fight / 回退片段栈不挂载，见 _attachFightGuard）
+    this._attachFightGuard(f);
     f.clip = startClip;
     f.desiredClip = startClip;
     f.amoName = 'tracking';
@@ -579,6 +743,170 @@ export class BoxingController {
     let delta = cur - ref;
     delta = ((delta + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
     return delta;
+  }
+
+  // ---- FIGHT 航向伺服（H1/H2 修复，2026-10-01）-----------------------------
+  // 缺陷：fight 参考片段 torso yaw 0.6s 内摆动 ±54°（峰峰 ~108°），机器人航向
+  // 被 motion_anchor_ori_b 观测锁在"参考 yaw + 常数 δ"上——反镜像相位表让
+  // B 机播错开相位的参考，双机各跟各的参考转身（按相位表开环计算互面误差平
+  // 均 98-102°、~73% 时间 >90°）；且 fight 无"转向对手"环路，rebaseYawDelta
+  // 以"当前朝向"为基准，朝向误差跨片段回绕永久保留（跟空气打）。
+  //
+  // 修复：维护平滑跟踪的 δ(t)，目标 δ*(t) = bearing(t) − refYaw(t)，即让
+  // "参考当前帧 anchor 朝向 + δ"恒等于"指向对手的方位角"。一致性约束：δ 同
+  // 时驱动 (a) 观测侧 policyTick 的 _qz 参考旋转（TrackingFighter.
+  // setHeadingOffset）与 (b) 状态侧（re）锚定的 rebaseToReference Rz(Δ)——
+  // 两侧共用同一 δ，观测与目标自洽（等价于把参考姿态整体绕机器人竖直轴旋转
+  // δ，关节角不变）。方案中"参考基座位置 x/y 偏移同步旋转"一项经核为空操作：
+  // 本 ONNX 导出无 anchor_pos 观测（has_state_estimation=False，obs 布局见
+  // tracking_policy.mjs 头注），opponent_state 全部为 body-frame 相对量，
+  // rebaseToReference 保留世界 x/y 不取参考位置——参考基座 x/y 从不进入任何
+  // 观测，无需旋转。
+  // δ 不做阶跃：回合内指数平滑 δ ← δ + (δ*−δ)·(1−e^(−dt/τ))，τ=headingTau
+  // （默认 0.3s）；（re）锚定边界（setTracking/swapTo/resetRound）δ 直接初
+  // 始化为 bearing − 参考相位帧 yaw，状态同刻被 RSI 到该朝向——边界时刻立即
+  // 面向对手。伺服关闭（A/B 基线）时所有路径回 rebaseYawDelta 旧语义，字节
+  // 不变。AMO 的 bearing 环路（update 的 f.amo 分支）与单人 tracking 模式不
+  // 经过本组方法。
+
+  // 方位角：self torso → 对手 torso 的水平 atan2（方案 §A：用双方 torso 世界
+  // 位置，非骨盆出生锚）。body id 走构造器缓存 _torsoBody。
+  fightBearing(side) {
+    const m = this.data.xpos;
+    const a = 3 * this._torsoBody[side];
+    const b = 3 * this._torsoBody[this.fighters[side].opponent.side];
+    return Math.atan2(m[b + 1] - m[a + 1], m[b] - m[a]);
+  }
+
+  // 锚定边界 δ0 = bearing − 参考起始帧 anchor torso yaw，归一化 (−π,π]。
+  // 与 rebaseYawDelta 同形，仅"当前 torso 实际 yaw"换成"指向对手的 bearing"
+  // ——时序约定相同：需在 mj_forward / 仿真步进之后调用（xpos/xquat 就绪）。
+  fightRebaseDelta(side, net, startStep = 0) {
+    const bearing = this.fightBearing(side);
+    const ai = net.meta.body_names.indexOf(net.meta.anchor_body_name);
+    const r = net.refAt(startStep).body_quat_w, ro = 4 * ai;
+    const ref = yawOfQuat(r[ro], r[ro + 1], r[ro + 2], r[ro + 3]);
+    let delta = bearing - ref;
+    delta = ((delta + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+    return delta;
+  }
+
+  // 回合内伺服目标 δ* = bearing − 参考当前帧（tracking.timeStep = 下一次
+  // policyTick 将消费的参考帧，与观测同帧自洽）anchor yaw。refAt 对越界帧
+  // 夹紧，与 policyTick 看到的帧一致。
+  fightServoTarget(side) {
+    const f = this.fighters[side];
+    const net = f.tracking.net;
+    const bearing = this.fightBearing(side);
+    const ai = net.meta.body_names.indexOf(net.meta.anchor_body_name);
+    const r = net.refAt(f.tracking.timeStep).body_quat_w, ro = 4 * ai;
+    const ref = yawOfQuat(r[ro], r[ro + 1], r[ro + 2], r[ro + 3]);
+    let delta = bearing - ref;
+    delta = ((delta + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+    return delta;
+  }
+
+  // 每物理步伺服推进：δ* 先归一化，再取与当前 δ 最近的代表（bearing 与
+  // refYaw 各自在 ±π 回绕时 δ* 可能跳 2π，不取近代表会让机器人反向转一整
+  // 圈）；δ 本身不归一化——四元数对幅值不敏感，保连续性。平滑只作用回合
+  // 内，不做角度阶跃（参考片段自身 yaw 变化率 ±3 rad/s，τ=0.3s 平滑覆盖该
+  // 带宽且滞后有限）。
+  updateFightHeadingServo(f, dt) {
+    const tf = f.tracking;
+    const target = this.fightServoTarget(f.side);
+    let err = target - tf.yawOffset;
+    err = ((err + Math.PI) % (2 * Math.PI) + 2 * Math.PI) % (2 * Math.PI) - Math.PI;
+    const alpha = 1 - Math.exp(-dt / this.headingTau);
+    tf.setHeadingOffset(tf.yawOffset + err * alpha);
+  }
+
+  // ---- FIGHT 守卫混合（抱架保持，2026-10-02）--------------------------------
+  // 消除"双臂垂下/双臂对称前推"：非出拳手臂的 PD 目标向高抱架目标混合
+  // （第 2 轮 P0-2 起为两级结构——覆写边界按持久水平重混 + 窗口内指数微调，
+  // 见 applyFightGuard 注释与常量区），出拳瞬间该臂交还策略。挂在
+  // TrackingFighter.targetHook 上（policyTick 之后、writeTorque 之前，见
+  // tracking_policy.mjs），guard/combo/非 fight 路径不挂载、字节不变。
+  // setTracking/swapTo/resetRound 三处 TrackingFighter 重建点后各调一次
+  // （divergence 自愈路径复用同一对象，钩子随对象存活，无需重挂）。
+  _attachFightGuard(f) {
+    if (!this.fightMode || !f.tracking || !f.trackingClips?.fight) return;
+    if (f.tracking.targetHook) return;
+    if (!this._fightGuard) {
+      const names = f.tracking.net.meta.joint_names;
+      const targets = new Float32Array(names.length);
+      const armIdx = { left: [], right: [] };
+      const ffIdx = { left: [], right: [] };
+      const ffVal = new Float32Array(names.length);
+      names.forEach((nm, i) => {
+        const g = FIGHT_GUARD_JOINTS[nm];
+        if (g !== undefined) {
+          targets[i] = g;
+          armIdx[nm.startsWith('left_') ? 'left' : 'right'].push(i);
+        }
+        const k = FIGHT_GUARD_FEEDFORWARD[nm];
+        if (k) {
+          ffVal[i] = k;
+          ffIdx[nm.startsWith('left_') ? 'left' : 'right'].push(i);
+        }
+      });
+      this._fightGuard = { targets, armIdx, ffIdx, ffVal };
+    }
+    f.tracking.targetHook = () => this.applyFightGuard(f);
+    // 前馈加性通道（见 FIGHT_GUARD_FEEDFORWARD 与 tracking_policy.mjs
+    // extraTorque 注释）：per-fighter 分配，索引与 pdTarget/writeTorque 同序。
+    if (!f.tracking.extraTorque) f.tracking.extraTorque = new Float32Array(f.tracking.n);
+  }
+
+  // 逐物理步守卫混合（见 _attachFightGuard 注释、文件头 FIGHT 视觉形态修复
+  // 小节与常量区第 2/4 轮 P0-2 说明）。两级结构：
+  //  - 持久混合水平：非出拳臂每步向 FIGHT_GUARD_MIX_MAX 指数回升
+  //    （τ=FIGHT_GUARD_MIX_TAU）；出拳判定（该臂拳速 EMA > FIGHT_PUNCH_SPEED，
+  //    真出拳 2-4 m/s，出手瞬间即放开门禁）时清零——该臂完全交还策略，收拳
+  //    后 ~0.23s 水平回升到 90%（τ=0.10，第 3 轮），把拳套拉回抱架。
+  //  - 应用：policyTick 覆写边界（stepCount % FIGHT_POLICY_DECIMATION === 0，
+  //    钩子在覆写后、stepCount 自增前被调用，见 physicsStep）按当前水平一次性
+  //    重混——水平不随覆写窗口归零，破"每窗口从头爬坡"瓶颈；窗口内在边界
+  //    结果上继续 τ=FIGHT_GUARD_TAU 的指数微调。
+  //  - 重力前馈（第 4 轮 P0-2，FIGHT_GUARD_FEEDFORWARD）：臂关节 8 项加性
+  //    力矩经 extraTorque 通道在 writeTorque 限幅前叠加，τ = k × guardMix
+  //    与混合水平同源缩放、无独立滞后。本钩子每物理步先清后写（出拳分支
+  //    清零该臂、早退路径整表清零），writeTorque 只消费本步刚写的值——
+  //    出拳瞬间前馈严格为零，无残留。用量入 fightForceUsage.ff。
+  // 倒地（骨盆 z<0.42）与策略不健康（NaN）时不混合，不干扰摔倒/自愈过程。
+  applyFightGuard(f) {
+    const tf = f.tracking;
+    const ff = tf && tf.extraTorque;
+    if (!tf || !tf.healthy) { if (ff) ff.fill(0); return; }
+    const d = this.data;
+    const pb = f.side === 'A' ? this.ids.pelvisA : this.ids.pelvisB;
+    if (d.xpos[3 * pb + 2] < 0.42) { if (ff) ff.fill(0); return; }
+    const g = this._fightGuard;
+    if (!g) return;   // 未挂载时 extraTorque 亦为 null，无残留
+    const pd = tf.pdTarget;
+    const atTick = tf.stepCount % FIGHT_POLICY_DECIMATION === 0;
+    const alpha = 1 - Math.exp(-this.model.opt.timestep / FIGHT_GUARD_TAU);
+    const rise = 1 - Math.exp(-this.model.opt.timestep / FIGHT_GUARD_MIX_TAU);
+    const u = this.fightForceUsage[f.side];
+    const dt = this.model.opt.timestep;
+    for (const hand of ['left', 'right']) {
+      for (const i of g.armIdx[hand]) ff[i] = 0;   // 先清整臂（含腕），再按比例写
+      if (f.fistSpeed[hand] > FIGHT_PUNCH_SPEED) {   // 出拳中：交还策略并清偏置
+        f.guardMix[hand] = 0;
+        continue;                                    // 前馈已随上方清零
+      }
+      const m = (f.guardMix[hand] += (FIGHT_GUARD_MIX_MAX - f.guardMix[hand]) * rise);
+      if (atTick) {
+        for (const i of g.armIdx[hand]) pd[i] += m * (g.targets[i] - pd[i]);
+      } else if (m > 0) {
+        for (const i of g.armIdx[hand]) pd[i] += alpha * (g.targets[i] - pd[i]);
+      }
+      if (m > 0) {
+        for (const i of g.ffIdx[hand]) {
+          ff[i] = g.ffVal[i] * m;
+          u.ff += Math.abs(ff[i]) * dt;
+        }
+      }
+    }
   }
 
   // §4.4/§4.5 追踪模式下该拳手当前是否处于有效出拳阶段：优先用元数据的
@@ -949,10 +1277,16 @@ export class BoxingController {
           // COMBO 模式锁 delta=0（同 setTracking，实测非零 delta 致倒）。
           // faceoff=1 时仅 B 侧例外（comboDelta），新 fighter 同步携带 faceoff
           // 修正标志，回绕重锚定与观测旋转保持世界系 Rz 同约定。
-          // fight 回绕走 rebaseYawDelta（当前朝向−参考起始帧 yaw），起始帧 =
-          // 本回合相位偏移——回绕不重置相位，否则与 A 重新镜像同步。
+          // fight 回绕（伺服关闭）：rebaseYawDelta（当前朝向−参考起始帧 yaw），
+          // 起始帧 = 本回合相位偏移——回绕不重置相位，否则与 A 重新镜像同步。
+          // 伺服开启时改为 fightRebaseDelta（bearing−参考相位帧 yaw），见下。
           const phase = want === 'fight' ? this._fightPhase[side] : 0;
-          const delta = this.comboMode ? this.comboDelta(side, f.trackingClips[want]) : this.rebaseYawDelta(side, f.trackingClips[want], phase);
+          // fight + 伺服：回绕重锚定 δ0 = bearing − 参考相位帧 yaw——回绕边
+          // 界立即面向对手（H2：旧 rebaseYawDelta 以当前朝向为基准，朝向误差
+          // 跨回绕永久保留）。伺服关闭回旧路径。
+          const delta = want === 'fight' && this.headingServo
+            ? this.fightRebaseDelta(side, f.trackingClips[want], phase)
+            : this.comboMode ? this.comboDelta(side, f.trackingClips[want]) : this.rebaseYawDelta(side, f.trackingClips[want], phase);
           const nf = new TrackingFighter(this.mujoco, this.model, this.data, side,
             f.trackingClips[want], { yawOffset: delta,
               faceoff: this.fightMode || (this.faceoffMode && side === 'B'),
@@ -961,6 +1295,7 @@ export class BoxingController {
           nf.rebaseToReference(delta, phase);
           this.mujoco.mj_forward(this.model, this.data);
           f.tracking = nf;
+          this._attachFightGuard(f);   // fight 回绕重建后重挂守卫混合钩子
           f.clip = want;
           f.clipSwaps++;
           f.desiredClip = 'guard';  // 队列已消费（无论打没打）
@@ -1016,7 +1351,14 @@ export class BoxingController {
             swapTo(f.desiredClip);
           }
         }
-        f.tracking.physicsStep(4);
+        // FIGHT 航向伺服（H1/H2 修复）：回合内 δ 指数平滑跟踪"参考帧朝向+δ
+        // = 指向对手"目标，观测侧（_qz 参考旋转）与状态侧（下次重锚定 δ0）
+        // 共用同一 δ——见 updateFightHeadingServo 注释。仅 fight 常驻片段生
+        // 效；AMO bearing 环路（上方 f.amo 分支）与单人 tracking 模式不经此处。
+        if (this.fightMode && this.headingServo && f.clip === 'fight') {
+          this.updateFightHeadingServo(f, dt);
+        }
+        f.tracking.physicsStep(FIGHT_POLICY_DECIMATION);
       } else if (f.amo) {
         f.amo.setCommand(
           vx * f.forward, vy, f.faceYaw,
@@ -1116,6 +1458,32 @@ export class BoxingController {
       }
       }
       const xfo = 6 * b;
+      // FIGHT 裁判分离力 + 距离保持力（2026-10-02，见文件头 FIGHT 视觉形态
+      // 修复小节）：与平衡辅助无关（assist 关闭仍生效）——分离力消除"贴脸
+      // 缠抱"（等效裁判分开缠斗），距离保持力在过远时温和拉近，制造可感知
+      // 的进退步法。仅 fight 模式、双方站立（骨盆 z≥0.40 与 KO 阈同口径）
+      // 时生效；方向 = 双方骨盆水平连线。
+      if (this.fightMode && !f.down) {
+        const opb = f.opponent.side === 'A' ? this.ids.pelvisA : this.ids.pelvisB;
+        const oz = d.xpos[3 * opb + 2];
+        if (pz >= 0.40 && oz >= 0.40) {
+          const dx = px - d.xpos[3 * opb], dy = py - d.xpos[3 * opb + 1];
+          const dd = Math.hypot(dx, dy) || 1e-6;
+          let ffx = 0, ffy = 0;
+          if (dd < FIGHT_SEP_DIST) {
+            const s = clamp(FIGHT_SEP_K * (FIGHT_SEP_DIST - dd), 0, FIGHT_SEP_FMAX);
+            ffx = s * dx / dd; ffy = s * dy / dd;
+            const u = this.fightForceUsage[side];
+            u.sx += Math.abs(ffx) * dt; u.sy += Math.abs(ffy) * dt;
+          } else if (dd > FIGHT_APPR_DIST) {
+            const s = clamp(FIGHT_APPR_K * (dd - FIGHT_APPR_DIST), 0, FIGHT_APPR_FMAX);
+            ffx = -s * dx / dd; ffy = -s * dy / dd;
+            const u = this.fightForceUsage[side];
+            u.ax += Math.abs(ffx) * dt; u.ay += Math.abs(ffy) * dt;
+          }
+          fx += ffx; fy += ffy;
+        }
+      }
       if (!Number.isFinite(fx + fy + fz + tx + ty + tz)) continue;
       // §4.6 辅助用量计量：对 |F|、|τ| 做时间积分（N·s / N·m·s）。放在有限性
       // 检查之后（NaN 不得污染计量），击退力在此之后才叠加，不计入——那是
@@ -1313,7 +1681,12 @@ export class BoxingController {
         // FIGHT 反镜像：参考起始帧 = 本回合相位偏移（_assignFightPhase 已刷新），
         // delta 基准帧与之对齐，重锚定瞬间 anchor-ori 观测归零（训练 RSI 起点）。
         const phase = clip === 'fight' ? this._fightPhase[side] : 0;
-        const delta = clip === 'fight' ? this.rebaseYawDelta(side, f.trackingClips[clip], phase)
+        // fight + 伺服：回合重置 δ0 = bearing − 参考相位帧 yaw（keyframe 出
+        // 生位面对面，与 setTracking 启动同状态，KO/超时重置后立即面向对手）；
+        // 伺服关闭回 rebaseYawDelta 旧基准（当前朝向=出生朝向）。
+        const delta = clip === 'fight' && this.headingServo
+          ? this.fightRebaseDelta(side, f.trackingClips[clip], phase)
+          : clip === 'fight' ? this.rebaseYawDelta(side, f.trackingClips[clip], phase)
           : this.comboMode && clip === 'combo' ? 0
           : this.rebaseYawDelta(side, f.trackingClips[clip]);
         f.tracking = new TrackingFighter(this.mujoco, this.model, this.data, side, f.trackingClips[clip],
@@ -1333,6 +1706,8 @@ export class BoxingController {
         }
         f.clip = clip;
         f.desiredClip = clip;
+        // FIGHT：回合重置重建后重挂守卫混合钩子（非 fight 路径空操作）
+        this._attachFightGuard(f);
       }
     }
     this.knockback = { A: null, B: null };

@@ -5,6 +5,7 @@ import { BoxingController } from './boxing_ai.mjs';
 import { AMONetwork } from './rl_policy.mjs';
 import { TrackingNetwork } from './tracking_policy.mjs';
 import { TacticsPolicy } from './tactics.mjs';
+import { applyFightScenePatch } from './fight_scene_patch.mjs';
 
 const loadMujoco = (await import('../vendor/mujoco/mujoco.js')).default;
 
@@ -161,34 +162,11 @@ const xml0 = await fetch(SCENE_FILE).then(r => r.text());
 // FIGHT 模式出生对峙（W4）：±0.5 → ±0.6（间距 1.2m，与训练侧
 // SPARRING_SPAWN_DIST=1.2 一致，A yaw 0 / B yaw π 面对面），同构替换、
 // 场景文件字节不动；fight 优先于 combo（FIGHT_MODE 蕴含 !COMBO_MODE）。
-// FIGHT 物理对齐补丁（终审 P1：接触场景确定性同步双倒——浏览器物理与训练
-// 场景的接触解析差异，仅 fight 分支打入，全部为字符串运行时替换）：
-//  1) 求解器对齐：iterations 100 → 10 + ls_iterations=20（训练侧
-//     tracking_env_cfg.py SimulationCfg.MujocoCfg 同值；欠收敛求解=接触更软，
-//     策略权重就是在该分布下训练/评估的）。
-//  2) 身体碰撞 hull condim 3 → 1：训练侧 FULL_COLLISION（g1_constants.py）
-//     除脚外全部 condim=1（无摩擦纯法向接触）；condim=3 的切向摩擦/扭转
-//     让双机贴身肢体接触互相"咬合"拖拽，是同步双倒主因（候选 #1）。
-//     注意 A_foot_capsule 类嵌套于 A_collision 类内部，故第 3) 条必须
-//     同步显式回写 condim=3，否则脚底失去摩擦立即摔倒。
-//  3) 脚类 geom 显式 condim=3 + friction 0.6 + priority=1（训练侧脚碰撞
-//     参数：friction=(0.6,), priority=1，抵消 2) 的类继承）。
-//  4) 拳头 geom 去 priority=1/friction=0.8 改 condim=1（训练侧
-//     hand_collision：默认 priority、condim=1、friction 默认）。
-// 训练侧无关节 damping 之外的额外注入；mjlab 默认 impratio=1/cone=pyramidal
-// 与浏览器默认一致，无需补。XML 文件字节不动；默认/combo 路径零触碰。
+// FIGHT 物理对齐补丁（终审 P1）：出生 ±0.6 + 求解器/condim 对齐——2026-10-01
+// 提取为 src/fight_scene_patch.mjs（浏览器与 headless 回归共用的同一函数，
+// 航向伺服验收要求两条路径逐字节同源）；补丁逐条依据的原文注释随迁到该模块。
 const xml = FIGHT_MODE
-  ? xml0
-      .split('-0.50 0 0.761').join('-0.60 0 0.761')
-      .split(' 0.50 0 0.761').join(' 0.60 0 0.761')
-      .split('solver="Newton" iterations="100"')
-        .join('solver="Newton" iterations="10" ls_iterations="20"')
-      .split('<geom group="3" rgba=".2 .6 .2 .3" type="capsule" contype="1" conaffinity="1" />')
-        .join('<geom group="3" rgba=".2 .6 .2 .3" type="capsule" contype="1" conaffinity="1" condim="1" />')
-      .split('<geom type="capsule" size="0.01" />')
-        .join('<geom type="capsule" size="0.01" condim="3" friction="0.6 0.005 0.0001" priority="1" />')
-      .split('contype="1" conaffinity="1" friction="0.8 0.005 0.0001" priority="1"')
-        .join('contype="1" conaffinity="1" condim="1"')
+  ? applyFightScenePatch(xml0)
   : COMBO_MODE
     ? xml0.split('-0.50 0 0.761').join('-1.20 0 0.761').split(' 0.50 0 0.761').join(' 1.20 0 0.761')
     : xml0;

@@ -1,6 +1,7 @@
 # G1 机器人拳击 · MuJoCo WASM + AMO 强化学习策略
 
-在浏览器里让 **两台 Unitree G1（23 自由度，官方 AMO 模型）** 互相拳击的实时物理仿真。
+在浏览器里让 **两台 Unitree G1（23 自由度，官方 AMO 模型）** 互相拳击的实时物理仿真；
+另有 29 自由度追踪场景与双机真实对打模式（URL 参数见"运行"一节）。
 物理引擎是 Google DeepMind 官方的 **MuJoCo WebAssembly 构建**（`@mujoco/mujoco` 3.13.0），
 渲染用 Three.js，全部计算都在浏览器本地完成，无需任何服务端。
 
@@ -12,12 +13,95 @@
 ## 运行
 
 ```bash
-node server.mjs 8080
+node server.mjs 8080   # 端口参数可选，默认 8080；被占用时换一个，如 node server.mjs 8090
 # 打开 http://localhost:8080/
 ```
 
+`/` 会 302 到 `/index.html?v=3`（规避浏览器对旧页面的长期缓存），静态文件均 `no-cache`。
+
+### URL 参数
+
+| URL | 场景 |
+|---|---|
+| 无参数 | 默认 AMO 场景：23-DoF，两台机器人 AMO 策略拳击 |
+| `?scene=tracking` | 29-DoF 追踪场景（探测 `vendor/policy/boxing_guard_meta.json`，缺失自动回退 AMO） |
+| `?scene=tracking&combo=1` | 双机组合拳常驻循环；子选项 `&faceoff=1` 让 B 机 180° 面向 A |
+| `?scene=tracking&fight=1` | **双机真实对打**（见下一节） |
+
+- `fight=1` 必须与 `scene=tracking` 同给才生效，且优先于 `combo`
+- 调试参数 `&policy=<名字>.bin`：改加载 `vendor/policy/` 下的其他 fight 权重
+  （如 `&policy=boxing_fight_dev.bin`）；名字只允许字母数字与 `._-`，非法名或
+  权重缺失时自动回退默认行为
+
 推荐使用 Chrome / Edge。首次加载需要下载约 21MB 的 WASM 引擎、51 个 STL 网格，
 启用 AMO 模式时还会再下载 18MB 策略权重。
+
+## 双机对打（fight 模式）
+
+`?scene=tracking&fight=1` 开启：两台 G1 共享同一 168 维观测（含对手状态 14 维）的
+fight 策略自主对打，KO / 回合重置 / 记分全部启用，无需面板干预。
+
+**互面航向伺服**（2026-10-01 合入）：机器人持续转向面向对手的闭环，fight 模式默认开启。
+
+- 浏览器端恒为开启（浏览器环境没有进程环境变量）
+- 无头 / node 环境 `FIGHT_HEADING_SERVO=0` 关闭（基线对比用）
+- `FIGHT_HEADING_TAU` 平滑时间常数（秒），夹紧 [0.05, 2.0]，默认 0.3
+
+### 无头量化命令与门槛
+
+```bash
+node tools/test_tracking_boxing.mjs 60 --fight --seed 1
+```
+
+输出互面误差（facing mean / median / p90、>90° 占比）、交战率、命中数、KO 与双机
+站立占比。质量门槛：median ≤ 35°、>90° ≤ 15%、命中 ≥ 3、双机站立 ≥ 60%
+（第 4 轮 P0-2 决胜轮实测，2026-10-02，60s --seed 1：median 21.4° / >90°
+4.3% / 命中 29 / 双机站立 89.4%，抱架保持率 A 88.9% / B 94.4%）。
+
+**形态指标与门槛（2026-10-02 形态修复）**：同一命令增补输出——
+
+- **贴身占比**：躯干水平间距 <0.35m 的时间占比，门槛 ≤15%（反"贴脸缠抱"）。
+- **抱架保持率**：非出拳状态下（任一臂拳速 EMA >1.2 m/s 即算出拳，整步
+  不计入分母；与运行时守卫混合出拳判定同一常量。2026-10-02 第 2 轮口径修订：
+  0.6 阈值被参考跟踪的常规摆臂过触发——"出拳中"占比 ~50% 而 60s 仅 9 次命中，
+  提到 1.2 m/s 后真出拳（2-4 m/s）仍可干净分离）双拳均"高于肘部 +0.03m
+  且接近头高（|拳套 z − 头 site z| ≤0.25m）"的时间占比，门槛 ≥70% 且
+  A/B 两侧各自 ≥70%（反"双臂垂下/抱架丢失"）。
+- 步法观察项（不设硬门）：骨盆水平路径长度/时长、躯干间距 min/mean/max。
+
+对应运行时修复（`src/boxing_ai.mjs` "FIGHT 视觉形态修复"小节，浏览器与
+headless 共用同一实现）：非出拳手臂 PD 目标向高抱架关节目标混合（拳套 FK 至
+torso 系 (0.195, 0.070, 0.399)，近头高/高于肘；第 2 轮 P0-2 修订：守卫混合
+改为两级结构——policyTick 覆写边界按跨窗口持久的混合水平一次性重混，稳态
+水平 = `FIGHT_GUARD_MIX_MAX`（第 3 轮起 0.8），窗口内继续指数微调，破"每窗
+口从头爬坡"瓶颈；第 4 轮 P0-2 修订：守卫肘目标 -0.35→-0.6 加深，并对守卫
+混合覆盖的 8 个臂关节加重力前馈（τ = k × 混合水平随比例缩放，出拳瞬间为零，
+见 `FIGHT_GUARD_FEEDFORWARD`））、躯干间距
+<0.42m 时施加限幅 80N 的裁判分离力、>1.25m 时施加限幅 28N 的距离保持力
+（用量在 `fight-shaping forces` 行透明报告；前馈用量另计入
+`fightForceUsage.ff`，供复验核查）。
+
+覆盖边界说明（2026-10-02 审查 P1-1）：fight 模式决策层短路、不消费注入 RNG，
+`--seed 1/2` 的输出逐字节相同（seed 参数在 fight 下仅形式留存）；验收场景
+（出生间距 1.2m）双机躯干水平间距实测 0.62-1.23m，不进入分离力（<0.42m）与
+接近力（>1.25m）的触发区间——该场景 `fight-shaping forces` 两项为 0 N·s 属
+预期，两项力的生效性由浏览器长时间对局观察覆盖，无头回归不测量。
+
+```bash
+# 关闭伺服的基线跑（仅关航向闭环；守卫混合/分离/接近力在伺服关闭时仍生效）。
+# 该跑用于对比航向伺服的净贡献。第 4 轮 P0-2 复测（60s --seed 1）：median
+# 83.4°（A 59.6° / B 110.3°，>90° 46.1%）——守卫前馈加固后伺服关闭基线已
+# 劣于伺服合入前的原始缺陷 ≈61°（高抱架改变了无航向闭环时的转向动力学，
+# 第 3 轮状态复测 median 71.9°，漂移主因在第 3/4 轮守卫加固，归因参考），
+# 航向伺服净贡献 83.4°→21.4° 依旧显著。该跑无质量门槛（缺陷诊断用）
+node tools/test_tracking_boxing.mjs 60 --fight --no-heading-servo --seed 1
+# 伺服调参示例
+FIGHT_HEADING_TAU=0.2 node tools/test_tracking_boxing.mjs 60 --fight --seed 1
+```
+
+训练侧（fight 策略训练与权重产物）不在此展开，见
+[`docs/plan-mjlab-gpu-training.md`](docs/plan-mjlab-gpu-training.md) 与
+[`docs/HANDOFF-FIGHT-20260929.md`](docs/HANDOFF-FIGHT-20260929.md)。
 
 ## AMO 强化学习模式（核心）
 
@@ -133,8 +217,16 @@ python .workbuddy/tmp/test_scene_dual.py   # python 侧 10s 双机器人回归
 # 阶段 4 追踪模式：
 node tools/test_tracking.mjs vendor/policy/boxing_guard   # JS↔ONNX 对齐
 node tools/test_tracking_sim.mjs boxing_guard             # 单机 sim2sim
-node tools/test_tracking_boxing.mjs 22 boxing             # 双机无头回归
+node tools/test_tracking_boxing.mjs                       # 追踪双机 16s 回归（含 KO 注入）→ 已知 FAIL（见下）
+BOXING_COMBO=1 node tools/test_tracking_boxing.mjs        # combo 42s 回归 → PASS
+node tools/test_tracking_boxing.mjs 22 boxing             # 追踪双机回归（22s，boxing 片段）
+node tools/test_tracking_boxing.mjs 60 --fight --seed 1   # 双机对打 60s 量化（门槛见"双机对打"节）→ PASS
+node tools/check_fight_meta.mjs                           # fight obs 布局契约检查
 ```
+
+**已知 FAIL**：`node tools/test_tracking_boxing.mjs`（默认 16s）在当前 HEAD
+即失败——A 机 t≈1.4s 摔倒触发 minZ 门槛（0.39 < 0.40）。经审查确认是航向
+伺服修复之前就存在的历史遗留，与 fight 模式无关。
 
 ## 战术 AI 自博弈训练
 

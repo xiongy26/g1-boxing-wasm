@@ -222,6 +222,19 @@ export class TrackingFighter {
     this.stepCount = 0;
     this.clipDone = false;
     this.healthy = true;
+    // PD 目标后处理钩子（fight 守卫混合用，2026-10-02）：每物理步在
+    // policyTick 之后、writeTorque 之前调用 targetHook(this)，可对 pdTarget
+    // 做最后修正（如非出拳手臂向守卫姿态混合）。默认 null —— guard/combo/
+    // faceoff 路径零调用，行为字节不变；仅 boxing_ai 的 fight 分支赋值。
+    this.targetHook = null;
+    // 前馈力矩加性通道（第 4 轮 P0-2，与 targetHook 同族的钩子传参，2026-
+    // 10-02）：非 null 时 writeTorque 逐关节在限幅前叠加 extraTorque[i]，
+    // 供 fight 守卫重力前馈使用（分配/清理由 boxing_ai._attachFightGuard /
+    // applyFightGuard 负责：per-fighter Float32Array(n)，每物理步先清后写，
+    // 出拳/早退路径清零）。默认 null——guard/combo/faceoff 路径 writeTorque
+    // 零分支，行为字节不变；不改任何状态机字段（stepCount/lastAction/pdTarget
+    // 语义照旧）。
+    this.extraTorque = null;
   }
 
   // 对手 body 引用解析（惰性缓存一次）：优先用注入对手 fighter 的 side 与
@@ -257,6 +270,17 @@ export class TrackingFighter {
     this.stepCount = 0;
     this.clipDone = false;
     this.healthy = true;
+  }
+
+  // FIGHT 航向伺服（boxing_ai.mjs updateFightHeadingServo 调用，2026-10-01）：
+  // 运行中更新 yaw 偏移 δ。δ 同时是观测侧（policyTick 的 _qz 参考旋转）与状
+  // 态侧（下次 rebaseToReference 的 Rz(Δ)）的唯一基准——两侧共用同一 δ，观测
+  // 与目标自洽。δ=0 时本方法构造的 _qz 是精确单位四元数（zw=1/zz=0 的乘加为
+  // IEEE 精确运算），与构造器 δ=0 → _qz=null 的旧路径数值等价；本方法仅被
+  // fight 伺服调用，guard/combo/faceoff 的一次性 delta 路径不经此处。
+  setHeadingOffset(delta) {
+    this.yawOffset = delta;
+    this._qz = [Math.cos(delta / 2), 0, 0, Math.sin(delta / 2)];
   }
 
   // 原位重锚定 RSI：把机器人状态设为训练回合起点——29 关节 qpos/qvel 取参考
@@ -308,15 +332,21 @@ export class TrackingFighter {
   // call every physics step (200 Hz); policy every DECIMATION steps
   physicsStep(decimation = 4) {
     if (this.stepCount % decimation === 0) this.policyTick();
+    // fight 守卫混合钩子（见构造器 targetHook 注释）：在 pdTarget 刚被
+    // policyTick 重算之后、力矩写出之前逐物理步修正——混合在策略目标之上
+    // 生效，不污染 lastAction（策略内部动作状态保持自洽）。
+    if (this.targetHook) this.targetHook(this);
     this.stepCount++;
     this.writeTorque();
   }
 
   writeTorque() {
     const d = this.data, pd = this.pdTarget, n = this.n;
+    const ff = this.extraTorque;   // fight 守卫重力前馈（null = 无，见构造器注释）
     for (let i = 0; i < n; i++) {
       const q = d.qpos[this.qposadr[i]], dq = d.qvel[this.dofadr[i]];
       let t = (pd[i] - q) * this.net.kp[i] - dq * this.net.kd[i];
+      if (ff) t += ff[i];
       const lim = this.lim[i];
       if (t > lim) t = lim; else if (t < -lim) t = -lim;
       d.ctrl[this.actId[i]] = t;
