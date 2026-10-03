@@ -5,8 +5,12 @@
 物理引擎是 Google DeepMind 官方的 **MuJoCo WebAssembly 构建**（`@mujoco/mujoco` 3.13.0），
 渲染用 Three.js，全部计算都在浏览器本地完成，无需任何服务端。
 
-> **项目总计划与进度总览见 [`docs/ROADMAP.md`](docs/ROADMAP.md)**；
-> GPU 训练执行手册见 [`docs/plan-mjlab-gpu-training.md`](docs/plan-mjlab-gpu-training.md)。
+> **项目总计划与进度总览见 [`docs/ROADMAP.md`](docs/ROADMAP.md)**。
+> 动作策略训练与导入流程见下文["动作策略训练与导入"](#动作策略训练与导入)一节
+> （训练链在本项目 `.workbuddy/gpu/g1dance_pipeline/`，fight 自博弈 v3 方案
+> [`docs/plan-fight-selfplay-v3.md`](docs/plan-fight-selfplay-v3.md)）；
+> [`docs/plan-mjlab-gpu-training.md`](docs/plan-mjlab-gpu-training.md) 所述
+> GPU 训练执行手册对应的本机训练链已停用（历史文档）。
 
 ![截图](docs/screenshot_amo.jpg)
 
@@ -102,9 +106,75 @@ node tools/test_tracking_boxing.mjs 60 --fight --no-heading-servo --seed 1
 FIGHT_HEADING_TAU=0.2 node tools/test_tracking_boxing.mjs 60 --fight --seed 1
 ```
 
-训练侧（fight 策略训练与权重产物）不在此展开，见
-[`docs/plan-mjlab-gpu-training.md`](docs/plan-mjlab-gpu-training.md) 与
-[`docs/HANDOFF-FIGHT-20260929.md`](docs/HANDOFF-FIGHT-20260929.md)。
+### v3 自博弈训练轮记录（2026-10-03，门槛未过 → v2 保持部署）
+
+fight 策略 v3 自博弈（方案 [`docs/plan-fight-selfplay-v3.md`](plan-fight-selfplay-v3.md)，
+训练链 `.workbuddy/gpu/g1dance_pipeline/`，任务 `Unitree-G1-Sparring-P3`）已完成
+A1/A2/B2 三轮训练与部署评估：d3 停机扫描择优、训练侧均达标，但
+**浏览器门槛三轮均未过，B2 后正式 `vendor/policy/boxing_fight.*` 仍为 v2**。
+
+- 来源 run：`.workbuddy/gpu/g1dance_pipeline/third_party/unitree_rl_mjlab/logs/rsl_rl/g1_sparring/2026-10-03_02-50-47`
+- best ckpt：`model_2000.pt`，d3 复合分 seed0 0.9624 / seed7 0.9627（v2 基线
+  同口径 0.8168 / 0.7926，+17.8%）；`verdict.json` 与 `best.pt` 在 run 目录
+- 部署链：`pipeline/export_ckpt_onnx.py`（P3 任务，168 维，run 目录的
+  `<run名>.onnx` 是末次保存的自动导出，历史 ckpt 须单独补导）→
+  `tools/extract_tracking_onnx.py` → `check_fight_meta.mjs` 14 项 PASS →
+  `test_tracking.mjs` JS↔ONNX 对齐 1.4e-6 PASS → 浏览器双 seed 回归
+
+浏览器 60s `--fight` 门槛实测（fight 模式决策层短路 RNG，`--seed 1/7` 输出同值；
+v2 仅 seed 1 有参考，v2 贴身值为 2026-10-03 回滚后复测）：
+
+| 指标 | v3 门槛 | v2 实测（seed 1） | v3 model_2000 实测（seed 1/7） | 判定 |
+|---|---|---|---|---|
+| 命中 | ≥40 | 29 | **2** | FAIL（主指标） |
+| 双机站立 | ≥90% | 89.4% | 100.0% | 过 |
+| 抱架保持 A/B | 各 ≥85% 且均值 ≥90% | 88.9% / 94.4% | 97.9% / 98.4% | 过 |
+| 航向 median | ≤25° | 21.4° | 15.3° | 过 |
+| >90° 占比 | ≤8% | 4.3% | 0.0% | 过 |
+| 贴身占比 | ≤12% | 0.0% | 0.0% | 过 |
+
+归因：v3 形态奖励在浏览器环境过度抑制出拳——训练侧命中和 1.05 次/s/env，
+浏览器 60s 仅 2 次命中（格挡 41 次、抱架保持 97.9%、交战率 91.4%）；候选 meta
+与 v2 逐字段一致（kp/kd、default_joint_pos、action_scale、motion 表全同），
+排除部署链问题，差异确系策略权重。已按方案 §4.5 回滚：正式三件套 md5 与 v2
+原件一致，回滚后 `60 --fight --seed 1` 复测 PASS（命中 29，与 v2 参考值吻合）。
+候选三件套保留在 `vendor/policy/boxing_fight_v3cand.*`，v2 备份在
+`vendor/policy/boxing_fight_v2.bak/`，供下一轮（形态权重调低重训，方案 §7
+止损路径）复用。
+
+**V3-B2 轮（2026-10-03，命中口径修复 + 形态权重减半重训，门槛未过 → v2
+保持）**：针对 A1/A2 部署失败根因，把训练侧命中口径改为与浏览器同口径
+（`fight_contact`/`fight_contact_rev` 拳 vs 头/躯干 body 精确匹配，排除对方
+手臂）后重训 3000 iters。
+
+- 来源 run：`.workbuddy/gpu/g1dance_pipeline/third_party/unitree_rl_mjlab/logs/rsl_rl/g1_sparring/2026-10-03_16-30-36`
+- best ckpt：`model_2500.pt`，d3 复合分 0.8885（v2 同口径基线 0.6605，
+  +34.5%）；新口径下头/躯干接触率 0.307 次/s/env = v2 的 16 倍；
+  `verdict.json` 与 `best.pt` 在 run 目录
+
+浏览器 60s `--fight` 复测：口径修复确认起效——命中全部为真实头/躯干打击，
+grazes 出现 10 次、与格挡正常分流；除主指标外其余全面优于 v2：
+
+| 指标 | v3 门槛 | v2 实测（seed 1） | B2 model_2500 实测 | 判定 |
+|---|---|---|---|---|
+| 命中 | ≥40 | 29 | **14**（A1/A2 曾为 2/3） | FAIL（主指标） |
+| 双机站立 | ≥90% | 89.4% | 100.0% | 过 |
+| 抱架保持 A/B | 各 ≥85% 且均值 ≥90% | 88.9% / 94.4% | 97.0% / 98.5% | 过 |
+| 航向 median | ≤25° | 21.4° | 15.9° | 过 |
+| >90° 占比 | ≤8% | 4.3% | 0.0% | 过 |
+
+判定：策略强度仍不及 v2，主指标未达门槛，**未替换**，正式权重保持 v2
+（回滚已 md5 验证）。候选三件套保留：`boxing_fight_v3cand`（A1）、
+`v3a2cand`（A2）、`v3b2cand`（B2）。后续可选（未承诺）：从 B2
+model_2500 续训 +3000 iters（命中曲线尚在爬升），或上调 hit/engage 权重
+再训；另 fight 模式决策层短路 RNG、双 seed 协议在 fight 下退化为单轨
+（harness 种子不影响 fight 轨迹），如需真双 seed 验收需先给 harness 加
+出生抖动 RNG 注入点。
+
+训练侧（fight 策略训练与权重产物）见下文
+["动作策略训练与导入"](#动作策略训练与导入)一节与
+[`docs/plan-fight-selfplay-v3.md`](docs/plan-fight-selfplay-v3.md)
+（历史交接：[`docs/HANDOFF-FIGHT-20260929.md`](docs/HANDOFF-FIGHT-20260929.md)）。
 
 ## AMO 强化学习模式（核心）
 
@@ -191,17 +261,11 @@ src/boxing_ai.mjs    拳击控制器（无头调参与浏览器共用）
 src/tactics.mjs      战术策略网络（纯 JS MLP + REINFORCE 更新 + Adam）
 src/main.js          浏览器主程序：WASM 初始化、VFS 喂入 STL、
                      mjv_updateScene 抽象场景 → Three.js 网格、HUD/计分/特效
-tools/gen_amo_scene.py      生成 AMO 双机器人场景 models/scene_boxing_amo.xml
-tools/gen_tracking_scene.py 生成 29-DoF 追踪双机器人场景
-                            models/scene_boxing_tracking.xml（物理与 mjlab 训练端
-                            逐项对齐：200Hz/armature/脚 priority 摩擦 0.6）
-tools/cut_boxing_clips.py   LAFAN1 fight CSV → 拳击技能片段（守卫过渡段）
 tools/extract_tracking_onnx.py  追踪 ONNX → bin/meta/测试向量（两种导出变体）
-tools/deploy_tracking_clips.sh  训练 run 目录 → vendor/policy/boxing_*
-tools/test_amo.mjs          无头回归：node tools/test_amo.mjs 22
 tools/test_tracking.mjs     追踪策略 JS↔ONNX 对齐
 tools/test_tracking_sim.mjs 追踪策略单机 sim2sim（WASM）
 tools/test_tracking_boxing.mjs  追踪模式双机无头回归
+tools/check_fight_meta.mjs  fight obs 布局契约检查
 vendor/policy/       amo.bin（18MB）+ spinkick.bin（管线保险）+ boxing_*（阶段4片段）
 vendor/mujoco/       @mujoco/mujoco 3.13.0（Apache-2.0）
 vendor/three/        three.js r170（MIT）
@@ -213,13 +277,12 @@ models/tracking_g1/  mjlab G1 29-DoF 基模型（阶段4）
 
 `vendor/policy/boxing_{guard,jab,cross,hook}.*` 齐备时自动启用：
 29-DoF G1 由动作片段策略驱动（战术决策排队片段，在守卫段首尾切换）。
-当前为 v0 预览（guard 策略四槽位，训练收敛后用
-`tools/deploy_tracking_clips.sh` 替换）。详见 `docs/stage4-tracking-notes.md`。
+当前为 v0 预览（guard 策略四槽位，训练收敛后按
+"动作策略训练与导入"一节替换）。详见 `docs/stage4-tracking-notes.md`。
 
 > **图例（2026-09-29）**：默认模式当前为 **guard-only**（守卫循环），完整拳法
 > 组合循环见 `?scene=tracking&combo=1`（双机 12.5s 组合拳常驻循环）。
 > 追加 `&faceoff=1` 开启面对面对抗子选项（B 机 180° 转身面向 A 机）。
-> 调试类脚本（`_probe_*`/`_diag_*`）已归档至 `tools/_archive/`。
 
 ### 场景模型的坑（务必知道）
 
@@ -249,7 +312,6 @@ models/tracking_g1/  mjlab G1 29-DoF 基模型（阶段4）
 ## 回归测试
 
 ```bash
-node tools/test_amo.mjs 22   # AMO 双机器人 + KO 注入 + 回合恢复 → PASS
 python .workbuddy/tmp/test_scene_dual.py   # python 侧 10s 双机器人回归
 # 阶段 4 追踪模式：
 node tools/test_tracking.mjs vendor/policy/boxing_guard   # JS↔ONNX 对齐
@@ -265,7 +327,43 @@ node tools/check_fight_meta.mjs                           # fight obs 布局契�
 即失败——A 机 t≈1.4s 摔倒触发 minZ 门槛（0.39 < 0.40）。经审查确认是航向
 伺服修复之前就存在的历史遗留，与 fight 模式无关。
 
+## 动作策略训练与导入
+
+本仓库为**纯推理**仓库：动作（跟踪）策略训练不在浏览器侧进行，训练链在本项目
+`.workbuddy/gpu/g1dance_pipeline/`（BeyondMimic/mjlab 跟踪训练管线本机副本，
+fight 自博弈 v3 方案见 [`docs/plan-fight-selfplay-v3.md`](docs/plan-fight-selfplay-v3.md)）。
+历史文档提及的 `/home/xy/zcode/g1-dance` 仓库**不承担本项目训练**：片段库
+（guard/jab 等）的跟踪策略沿用已部署权重，如需再训在本项目内按 v3 模式
+（新任务注册名 + 新 cfg + 新训练入口）扩展。
+
+训练产物 run 目录内的 `<run名>.onnx`（内嵌参考动作数组与元数据；注意该文件是
+**最后一次保存时的自动导出**，历史 ckpt 需先用训练侧
+`pipeline/export_ckpt_onnx.py <model_XXX.pt> <outdir> --task <任务名>` 补导）
+用本仓库的 `tools/extract_tracking_onnx.py` 转换为 `vendor/policy/<slot>.bin` +
+`<slot>_meta.json` + `<slot>_test_vectors.json` 三件套：
+
+```bash
+uv run --no-project --with onnx --with onnxruntime python \
+    tools/extract_tracking_onnx.py <run目录>/<run名>.onnx vendor/policy/<slot>
+```
+
+**文件名必须匹配加载端硬编码槽位**：片段库 `boxing_{guard,jab,cross,hook,combo}`
+（`src/main.js` 53-57 行 `TRACKING_CLIPS`），fight 策略 `boxing_fight`
+（`src/main.js` 85-89 行）。
+
+导入后依次回归：
+
+```bash
+node tools/test_tracking.mjs vendor/policy/<slot>   # JS↔ONNX 对齐（1e-6 相对门槛，绝对下限 1e-6）
+node tools/test_tracking_sim.mjs <slot>             # 单机 sim2sim（WASM）
+node tools/test_tracking_boxing.mjs 22 boxing       # 双机无头回归
+```
+
 ## 战术 AI 自博弈训练
+
+> 战术（决策）自博弈训练仍在仓库内进行（CPU、纯 node）；动作（跟踪）策略
+> 训练在本项目 `.workbuddy/gpu/g1dance_pipeline/` 进行，见上一节与
+> "双机对打"节的 v3 训练轮记录。
 
 ```bash
 node tools/train_tactics.mjs --episodes 3000 --workers 6 --ep-len 24

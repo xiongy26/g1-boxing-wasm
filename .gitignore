@@ -16,3 +16,7 @@ Thumbs.db
 .workbuddy/
 .venv/
 *.log
+
+# v3 三轮候选权重与 v2 回滚备份：本地保留、不进版本库（正式权重为 vendor/policy/boxing_fight.*）
+vendor/policy/boxing_fight_v*cand*
+vendor/policy/boxing_fight_v2.bak/

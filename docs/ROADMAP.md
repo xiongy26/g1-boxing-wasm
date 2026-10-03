@@ -97,13 +97,13 @@
 
 ## 六、验证体系（贯穿所有阶段）
 
-- `node tools/test_amo.mjs 22` — 无头回归：双机对战 + KO 注入 + 回合恢复（每次改动必跑）
+- `node tools/test_tracking_boxing.mjs 22 boxing` — 无头回归：双机对战 + KO 注入 + 回合恢复（每次改动必跑；原 `test_amo.mjs` 已删除，此为现行等价命令）
 - `node tools/eval_tactics.mjs 16 14` — 战术层 vs 旧版量化对比
 - `node tools/test_tactics_grad.mjs` — 战术层解析梯度 vs 数值微分（更新实现必跑）
 - `node tools/test_tracking.mjs vendor/policy/<name>` — 追踪策略 JS 前向 vs ONNX 逐向量对齐（阶段 4）
 - `node tools/test_tracking_sim.mjs <name>` — 追踪策略单机 sim2sim（WASM 场景整段跟踪不倒，阶段 4）
 - `node tools/test_tracking_boxing.mjs 22 boxing [--assist] [--seed N]` — 追踪模式双机无头回归（辅助开关分别报告）
-- `node tools/check_clip.mjs <clips目录> --enrich` — 片段 FK 检查 + manifest 回填（重定向后必跑）
+- `node tools/check_clip.mjs <clips目录> --enrich` — 片段 FK 检查 + manifest 回填（重定向后必跑；`tools/check_clip.mjs` 已不在仓库，历史条目留档）
 - `.workbuddy/gpu/e2e_tracking.cjs` — 浏览器 E2E（追踪模式；`.workbuddy/tmp/e2e_default_rl.cjs` 为 AMO 模式）
 - python↔JS 逐 tick 对齐 — 任何新策略移植的验收标准（~1e-6 误差）
 

@@ -1,5 +1,8 @@
 # G1 拳击动作跟踪训练 — GPU 机器执行手册
 
+> ⚠️ 本文档所述 .workbuddy/gpu 本机训练链已于 2026-10 停用；动作训练移交
+> /home/xy/zcode/g1-dance（见其 docs/ACTION_WORKFLOW.md）。本文仅作历史记录。
+
 > 写于 2026-09-23。本文档面向**在一台有 NVIDIA GPU 的机器上执行训练**的开发者，
 > 与本仓库（g1-boxing-wasm，浏览器端 MuJoCo WASM 项目）对接。
 > 路线依据：`docs/research-boxing-approaches.md` 的"路线 B"，范本
