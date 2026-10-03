@@ -6,6 +6,7 @@ import { AMONetwork } from './rl_policy.mjs';
 import { TrackingNetwork } from './tracking_policy.mjs';
 import { TacticsPolicy } from './tactics.mjs';
 import { applyFightScenePatch } from './fight_scene_patch.mjs';
+import { createBoxingGlove } from './boxing_gloves.js';
 
 const loadMujoco = (await import('../vendor/mujoco/mujoco.js')).default;
 
@@ -405,6 +406,27 @@ const meshes = [];      // one three mesh per mjv geom slot
 const group = new THREE.Group();
 scene.add(group);
 
+const gloveGeoms = new Map();
+const coveredHandMeshes = new Set();
+for (const side of ['A', 'B']) {
+  for (const hand of ['left', 'right']) {
+    const fistId = id(OBJ.mjOBJ_GEOM, `${side}_${hand}_fist`);
+    if (fistId < 0) continue;
+    // AMO nests the fist inside the rubber-hand body; tracking puts it on
+    // the wrist directly. Account for that offset so both cuffs fit the wrist.
+    const rubberBody = id(OBJ.mjOBJ_BODY, `${side}_${hand}_rubber_hand`);
+    const bodyId = Number(model.geom_bodyid[fistId]);
+    const handOffset = bodyId === rubberBody ? Number(model.body_pos[3 * bodyId]) : 0;
+    gloveGeoms.set(fistId, {
+      hand, wristX: -Number(model.geom_pos[3 * fistId]) - handOffset,
+    });
+    for (const name of [`${side}_${hand}_rubber_hand`, `${hand}_rubber_hand`]) {
+      const meshId = id(OBJ.mjOBJ_MESH, name);
+      if (meshId >= 0) coveredHandMeshes.add(meshId);
+    }
+  }
+}
+
 function syncRenderer() {
   mujoco.mjv_updateScene(model, data, mjvOption, mjvPerturb, mjvCamera,
     mujoco.mjtCatBit.mjCAT_ALL.value, mjvScene);
@@ -432,11 +454,13 @@ function syncRenderer() {
       }
 
       let mesh = meshes[i];
-      const cacheKey = JSON.stringify([type, size, meshId]);
+      const glove = objtype === OBJ.mjOBJ_GEOM.value ? gloveGeoms.get(objid) : null;
+      const cacheKey = JSON.stringify([type, size, meshId, glove ? objid : null]);
       if (!mesh || mesh.userData.key !== cacheKey) {
         if (mesh) group.remove(mesh);
-        const geo = getGeometry(mjvGeomShim(type, meshId, size));
-        mesh = new THREE.Mesh(geo, new THREE.MeshPhongMaterial({
+        const color = new THREE.Color(rgba[0], rgba[1], rgba[2]);
+        const geo = glove ? null : getGeometry(mjvGeomShim(type, meshId, size));
+        mesh = glove ? createBoxingGlove(color, glove.hand, glove.wristX) : new THREE.Mesh(geo, new THREE.MeshPhongMaterial({
           color: new THREE.Color(rgba[0], rgba[1], rgba[2]),
           transparent: rgba[3] < 1, opacity: rgba[3],
           shininess: 24, specular: new THREE.Color(0x222222),
@@ -446,7 +470,7 @@ function syncRenderer() {
         mesh.userData.key = cacheKey;
         meshes[i] = mesh;
         group.add(mesh);
-      } else {
+      } else if (!glove) {
         mesh.material.color.setRGB(rgba[0], rgba[1], rgba[2]);
         mesh.material.opacity = rgba[3];
         mesh.material.transparent = rgba[3] < 1;
@@ -458,7 +482,7 @@ function syncRenderer() {
         mat9[6], mat9[7], mat9[8], pos[2],
         0, 0, 0, 1);
       mesh.matrixWorldNeedsUpdate = true;
-      mesh.visible = true;
+      mesh.visible = !(type === mujoco.mjtGeom.mjGEOM_MESH.value && coveredHandMeshes.has(meshId));
     }
   } finally {
     geoms.delete();
