@@ -1,7 +1,7 @@
 // G1 robot boxing — browser app: MuJoCo WASM physics + Three.js rendering.
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { BoxingController } from './boxing_ai.mjs';
+import { BoxingController, VICTORY_DURATION } from './boxing_ai.mjs';
 import { AMONetwork } from './rl_policy.mjs';
 import { TrackingNetwork } from './tracking_policy.mjs';
 import { TacticsPolicy } from './tactics.mjs';
@@ -563,7 +563,7 @@ function handleEvents() {
     } else if (ev.type === 'ko') {
       const w = ev.winner === 'A' ? '红方 G1-A' : '蓝方 G1-B';
       const c = ev.winner === 'A' ? 'var(--red)' : 'var(--blue)';
-      banner(`<span style="color:${c}">K O !</span><span class="small">${w} 获胜</span>`, 2600);
+      banner(`<span style="color:${c}">K O !</span><span class="small">${w} 获胜 · 举拳庆祝</span>`, VICTORY_DURATION * 1000);
     } else if (ev.type === 'round') {
       roundNo++;
       ui.round.textContent = roundNo;

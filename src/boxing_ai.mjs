@@ -78,6 +78,7 @@ const FACE_YAW_RATE = 2.5;
 // FIGHT_MODE（Q6 裁决）：60s 单回合循环——超时即重开回合，无局数上限；KO
 // 摔倒路径经 koState 结算后同样回到 resetRound。训练侧 episode 保持 10s 不变。
 const FIGHT_ROUND_S = 60;
+export const VICTORY_DURATION = 5.5;
 
 // FIGHT 反镜像（终审 P1 第 2 轮根因修复）：镜像出生 + 共享策略 + 对称观测 +
 // 确定性物理 = 确定性镜像锁定（zA===zB 逐位相等、同步双倒、零命中）。训练
@@ -1087,6 +1088,78 @@ export class BoxingController {
     return [this.data.xpos[3 * b], this.data.xpos[3 * b + 1], this.data.xpos[3 * b + 2]];
   }
 
+  // Post-result presentation, not a learned balance skill. Hold the winner's
+  // body while blending to an upright, raised-glove pose; the loser stays limp.
+  // Only the winner's coordinates are authored, so the KO fall still simulates.
+  updateVictory() {
+    const result = this.koState;
+    const { model: m, data: d } = this;
+    const side = result.winner;
+    const root = side === 'A' ? this.ids.pelvisA : this.ids.pelvisB;
+    if (!result.pose) {
+      const joints = [];
+      for (let j = 0; j < m.njnt; j++) {
+        let body = m.jnt_bodyid[j];
+        while (body > 0 && body !== root) body = m.body_parentid[body];
+        if (body !== root) continue;
+        const q = m.jnt_qposadr[j], v = m.jnt_dofadr[j];
+        const nq = m.jnt_type[j] === 0 ? 7 : m.jnt_type[j] === 1 ? 4 : 1;
+        const nv = nq === 7 ? 6 : nq === 4 ? 3 : 1;
+        const start = Array.from(d.qpos.subarray(q, q + nq));
+        const target = Array.from(m.key_qpos.subarray(q, q + nq));
+        if (nq === 7) {
+          target[0] = start[0]; target[1] = start[1];
+          const yaw = yawOfQuat(...start.slice(3));
+          target.splice(3, 4, Math.cos(yaw / 2), 0, 0, Math.sin(yaw / 2));
+          if (start.slice(3).reduce((s, x, i) => s + x * target[i + 3], 0) < 0) {
+            for (let k = 3; k < 7; k++) target[k] *= -1;
+          }
+        }
+        joints.push({ j, q, v, nq, nv, start, target });
+      }
+      for (const hand of ['left', 'right']) {
+        const targets = {
+          // Abduct the upper arms so elbows sit OUTSIDE the fists; rotating
+          // the shoulders inward produces the wrong, pinched celebration.
+          shoulder_pitch: -1.80, shoulder_roll: hand === 'left' ? 1.60 : -1.60,
+          shoulder_yaw: 0, elbow: 0,
+          wrist_roll: 0, wrist_pitch: 0, wrist_yaw: 0,
+        };
+        for (const [name, angle] of Object.entries(targets)) {
+          const j = this._jid(side, `_${hand}_${name}_joint`);
+          const entry = joints.find(x => x.j === j);
+          if (entry) entry.target[0] = clamp(angle, m.jnt_range[2 * j], m.jnt_range[2 * j + 1]);
+        }
+      }
+      result.pose = joints;
+      this.fighters[side].state = 'victory';
+    }
+    const elapsed = this.time - result.t;
+    const blend = smooth(clamp(elapsed / 1.4, 0, 1));
+    this.writeLimp('A'); this.writeLimp('B');
+    for (const s of ['A', 'B']) {
+      const b = s === 'A' ? this.ids.pelvisA : this.ids.pelvisB;
+      d.xfrc_applied.fill(0, 6 * b, 6 * b + 6);
+    }
+    for (const entry of result.pose) {
+      const { q, v, nq, nv, start, target } = entry;
+      for (let k = 0; k < nq; k++) d.qpos[q + k] = start[k] + (target[k] - start[k]) * blend;
+      if (nq === 7) {
+        const norm = Math.hypot(...d.qpos.subarray(q + 3, q + 7));
+        for (let k = 3; k < 7; k++) d.qpos[q + k] /= norm;
+      }
+      d.qvel.fill(0, v, v + nv);
+    }
+    // A gentle, symmetric fist pump after the hands reach overhead.
+    const pump = elapsed > 1.4 ? 0.07 * Math.sin((elapsed - 1.4) * 5) ** 2 : 0;
+    for (const hand of ['left', 'right']) {
+      const j = this._jid(side, `_${hand}_shoulder_pitch_joint`);
+      d.qpos[m.jnt_qposadr[j]] += pump;
+    }
+    this.mujoco.mj_forward(m, d);
+    if (elapsed >= VICTORY_DURATION) this.resetRound();
+  }
+
   update(dt) {
     const d = this.data;
     dt = Number.isFinite(dt) ? dt : (this.model.opt?.timestep ?? 0.002);
@@ -1119,13 +1192,7 @@ export class BoxingController {
     this.time += dt;
 
     if (this.koState) {
-      // limp both robots while the KO settle plays out, then reset the round
-      this.writeLimp('A'); this.writeLimp('B');
-      for (const side of ['A', 'B']) {
-        const b = side === 'A' ? this.ids.pelvisA : this.ids.pelvisB;
-        for (let k = 0; k < 6; k++) d.xfrc_applied[6 * b + k] = 0;
-      }
-      if (this.time - this.koState.t > 2.2) this.resetRound();
+      this.updateVictory();
       return;
     }
 
